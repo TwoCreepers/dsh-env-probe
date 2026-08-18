@@ -1,0 +1,39 @@
+{
+  "name": "dsh-env-probe",
+  "version": "1.0.1",
+  "description": "Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environment (OS / shells / runtimes / tools / disks / proxy) once, caches the report, and injects it into every session's system prompt so the agent starts each conversation already knowing what this computer offers. Adds /env-refresh and /env-suggest slash commands where a command adapter is composed.",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nodata404/dsh-env-probe.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "environment",
+    "system-prompt"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

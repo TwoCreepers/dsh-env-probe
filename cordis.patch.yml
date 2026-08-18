@@ -1,0 +1,13 @@
+# dsh-env-probe bundle patch: one insert over the profile root.
+#
+# Installed as a bundle dependency (github:nodata404/dsh-env-probe), the dsh
+# loader reads this file from the `dsh.bundle.patch` field in package.json and
+# applies it as a patch layer. Later layers (e.g. the user's profile
+# cordis.patch.yml) address this row by id, with the last write winning.
+- insert:
+    - id: env-probe
+      name: 'dsh-env-probe'
+      config:
+        language: en
+        order: 30
+        cacheTtlHours: 168
