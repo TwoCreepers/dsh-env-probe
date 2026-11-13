@@ -11,5 +11,9 @@
         language: en
         order: 30
         cacheTtlHours: 168
+        # /env-refresh hands its diff to the model as a `notice` context
+        # message; `steer` wakes the agent to answer it, `inject` only queues
+        # it for the next step, `off` keeps the result in the UI.
+        notifyModel: steer
         # runtimes / tools / shells / versionArgs / execAliases are optional;
         # see README for the configurable probe tables.

@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environment (OS / shells / runtimes / tools / disks / proxy) once, caches the report on disk, injects it as an ordered system-prompt section, and exposes the same facts to the model as tools.
 
-> **Local fork (v1.3.x)** of [nodata404/dsh-env-probe](https://github.com/nodata404/dsh-env-probe) v1.0.1. Changes are listed under "Changes since 1.0.1".
+> **Local fork (v1.4.x)** of [nodata404/dsh-env-probe](https://github.com/nodata404/dsh-env-probe) v1.0.1. Changes are listed under "Changes since 1.0.1".
 
 ## Two modes
 
@@ -37,11 +37,27 @@ There is no "cache expired" marker either: an expired cache only triggers a sile
 
 | Entry point | Audience | Behaviour |
 |---|---|---|
-| `/env-refresh` | humans (slash command; needs a command adapter) | re-probes, rewrites the cache, returns **only the diff**; blocks on an in-flight probe |
+| `/env-refresh` | humans (slash command; needs a command adapter) | re-probes, rewrites the cache, returns **only the diff**, and injects the outcome into the model's context (see below); blocks on an in-flight probe |
 | `env_refresh` tool | the model | same, returning structured `{ ok, probedAt, summary, added[], removed[], changed[] }` |
 | `env_probe` tool | the model / PTC | the snapshot as structured data (`entries[].path`, …); serves a cache younger than `cacheTtlHours` as-is, otherwise probes once; waits for an in-flight probe instead of racing it |
 
-The two tools answer with structured values so a PTC (`run_code`) agent can read a path and call it directly:
+## How `/env-refresh` reaches the model
+
+`dsh-commands` runs a slash command in the UI plane by design: neither the command nor its result ever becomes a model message, so a text-only result leaves the model blind to the refresh. `/env-refresh` therefore hands its outcome to the receiving agent as a producer-supplied context message (`source.kind = 'env-probe'`, `form: 'notice'`, with a one-line summary bounded to 120 characters). The Chat renders it as the same collapsed "Context injection · env-probe" row `time-context` uses, and the model reads the full diff in its next step.
+
+`notifyModel` picks the wake policy:
+
+| `notifyModel` | Behaviour |
+|---|---|
+| `'steer'` (default) | submit the notice and wake the agent, so it answers the refresh right away |
+| `'inject'` | submit the notice only; it lands in the next accepted step without waking an idle agent |
+| `'off'` | UI-only result, the pre-1.4 behaviour |
+
+A failed probe injects a failure notice instead, so the model stops trusting the old snapshot.
+
+## Using the two tools
+
+They answer with structured values so a PTC (`run_code`) agent can read a path and call it directly:
 
 ```js
 const env = await tools.env_probe({});
@@ -84,6 +100,7 @@ Structured part: `added: [{name, kind, available, path, version}]`, `removed: [n
 |---|---|---|
 | `cacheTtlHours` | `24` | cache lifetime; an expired cache only triggers a silent background re-probe |
 | `injectSection` | `true` | register the system-prompt section; `false` = tool-only, zero prompt cost |
+| `notifyModel` | `'steer'` | how `/env-refresh` reaches the model: `'steer'` inject and wake, `'inject'` inject only, `'off'` UI only |
 | `order` | `30` | system-prompt section order |
 | `language` | `'en'` | injected text language: `'en'` / `'zh'` |
 | `cacheDir` | `'~/.dsh-env-probe'` | cache directory (`env-profile.json` + `env-profile.md`) |
@@ -118,6 +135,7 @@ Example (profile `cordis.patch.yml`):
     language: en
     cacheTtlHours: 24
     injectSection: true        # false = tools only, nothing in the prompt
+    notifyModel: steer         # /env-refresh result: steer wakes, inject only queues, off is UI-only
     runtimes: [git, node, npm, pnpm, uv, dotnet, python, pip, java, go, rustc, docker]
     tools: [7z, just, sqlite3, curl, wget, ffmpeg, tar, unzip, make, gcc, pwsh]
     versionArgs:
@@ -138,6 +156,7 @@ Example (profile `cordis.patch.yml`):
 9. **The diff distinguishes kinds of change**: a version bump renders as `~ name: old -> new`, a relocated executable as `~ name (path): old -> new`.
 10. **TTL defaults to 24 hours**, the "cache expired" notice is gone, and `injectSection` can turn injection off entirely.
 11. **No relative age in the injected header**: only the absolute probe time, so the system prompt stays byte-identical until the snapshot is actually rewritten (prompt-cache friendly).
+12. **`/env-refresh` now reaches the model**: the handler hands the diff to the agent as a `form: 'notice'` context message, so the Chat shows "Context injection · env-probe" and the model sees the result. `notifyModel` (`steer` / `inject` / `off`) picks the wake policy; the default is `steer`.
 
 ## Plugin contract
 

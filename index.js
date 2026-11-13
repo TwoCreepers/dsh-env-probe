@@ -32,6 +32,15 @@
 //     age), so a warm cache keeps the prompt byte-identical across turns and
 //     the provider-side prompt cache keeps hitting; env_probe refreshes by
 //     itself once the cache is older than the TTL.
+//   - v1.4.0: `/env-refresh` no longer ends in the UI plane. `dsh-commands`
+//     intentionally never sends a command or its result to the model, so the
+//     handler now hands its outcome to the receiving agent as a producer
+//     supplied context message (`source.kind = 'env-probe'`,
+//     `form: 'notice'`): the Chat renders it as the collapsed "Context
+//     injection · env-probe" row and the model reads it in the next step.
+//     `notifyModel` picks `steer` (wake the agent and answer), `inject` (add
+//     it to the next accepted step without waking) or `off` (UI only, the
+//     v1.3.0 behavior). A probe failure is reported the same way.
 //
 // Generic by design: no machine-specific endpoints, no local-service checks,
 // every probe item is configurable. Read-only commands only.
@@ -55,6 +64,7 @@
 //     config:
 //       cacheTtlHours: 168        # re-probe when the cache is older
 //       injectSection: true       # false = tools only, nothing injected
+//       notifyModel: 'steer'      # /env-refresh context: 'steer' | 'inject' | 'off'
 //       order: 30                 # systemPrompt section order
 //       language: 'en'            # section text language: 'en' | 'zh'
 //       cacheDir: '~/.dsh-env-probe'
@@ -70,6 +80,7 @@
 //       totalTimeoutMs: 30000
 //       concurrency: 4
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { arch, cpus, homedir, platform, release, totalmem, type as osType, version as osVersion } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -120,6 +131,13 @@ const DEFAULTS = {
     // tool-only plugin: nothing is injected, so every turn's prompt stays
     // byte-identical and the provider-side prompt cache keeps hitting.
     injectSection: true,
+    // How `/env-refresh` hands its outcome to the model. The command plane
+    // never reaches the model by itself, so this is the only path:
+    //   'steer'  - submit the result as context and wake the agent (it answers)
+    //   'inject' - submit the result as context only; it lands in the next step
+    //              the user or a tool starts, without waking an idle agent
+    //   'off'    - UI-only result, exactly the v1.3.0 behavior
+    notifyModel: 'steer',
     runtimes: DEFAULT_RUNTIMES,
     tools: DEFAULT_TOOLS,
     shells: DEFAULT_SHELLS,
@@ -258,6 +276,9 @@ export const Config = {
             }
             if (input.injectSection !== undefined && typeof input.injectSection !== 'boolean') {
                 issues.push({ message: 'injectSection must be a boolean', path: ['injectSection'] });
+            }
+            if (input.notifyModel !== undefined && !['steer', 'inject', 'off'].includes(input.notifyModel)) {
+                issues.push({ message: "notifyModel must be 'steer', 'inject' or 'off'", path: ['notifyModel'] });
             }
             const nameList = (key, value) => Array.isArray(value) && value.every(v => typeof v === 'string' && NAME_RE.test(v));
             for (const key of ['runtimes', 'tools', 'shells']) {
@@ -486,7 +507,12 @@ const L = {
         cmdHint: 'no arguments; press Enter',
         cmdRefreshed: 'Environment snapshot refreshed',
         cmdProbeFailed: 'environment probe failed',
+        cmdNotified: 'The result was also injected into this conversation as model context.',
         noChanges: 'no changes since the previous probe',
+        noticeIntro: 'The user ran the /env-refresh command, which re-probed this machine\'s environment just now. This notice replaces any earlier ENV-PROBE snapshot in this conversation.',
+        noticeChanges: 'Changes since the previous probe:',
+        noticeHint: 'The cached snapshot has been rewritten. Call the `env_probe` tool when you need the full entry list with paths and versions.',
+        noticeFailed: 'The user ran the /env-refresh command and the environment probe failed. Re-probe before relying on the previous snapshot.',
         toolDesc: 'Re-probe this machine\'s environment now (OS, shells, runtimes, tools, disks, proxy), rewrite the cached snapshot, and return ONLY the diff against the previous probe as structured data (added / removed / changed). Blocks until an already-running probe finishes. Call it after installing, upgrading or removing a tool, or when a path or version from the injected ENV-PROBE snapshot no longer matches reality. Read-only: it never installs anything.',
         toolNoArgs: 'Takes no arguments.',
         probeDesc: 'Read the current machine environment snapshot as structured data: OS, shell, disks, proxy, and one entry per configured runtime and tool with name, kind, available, path and version. Answer comes from the cached snapshot when it is still within cacheTtlHours; otherwise (or when no snapshot exists) it probes once. If a probe is already running it waits for that run instead of racing it. Use it to resolve an executable path (e.g. the python or node entry) before calling another tool, instead of guessing PATH or shelling out to `where`/`which`. Call env_refresh when you specifically need the diff.',
@@ -506,7 +532,12 @@ const L = {
         cmdHint: '无需参数，直接回车',
         cmdRefreshed: '环境快照已刷新',
         cmdProbeFailed: '环境探测失败',
+        cmdNotified: '结果已同时作为模型上下文注入本次对话。',
         noChanges: '较上次探测无变化',
+        noticeIntro: '用户执行了 /env-refresh 命令，刚刚重新探测了本机环境。这条通知取代本次对话中此前的 ENV-PROBE 快照。',
+        noticeChanges: '与上次探测的差异：',
+        noticeHint: '缓存已重写。需要带路径与版本的完整条目清单时，调用 `env_probe` 工具。',
+        noticeFailed: '用户执行了 /env-refresh 命令，但环境探测失败。依赖此前的快照之前先重新探测。',
         toolDesc: '立即重新探测本机环境（系统、shell、运行时、工具、磁盘、代理），重写环境快照缓存，只返回与上次探测的差异（结构化 added / removed / changed）。已有探测在进行时会阻塞等待其完成。安装、升级、卸载工具后，或注入的 ENV-PROBE 快照中的路径/版本与实际不符时调用。只读操作，不会安装任何东西。',
         toolNoArgs: '无参数。',
         probeDesc: '以结构化数据读取当前的本机环境快照：系统、shell、磁盘、代理，以及每个已配置运行时与工具的名称、kind、available、path、version。缓存在 cacheTtlHours 内就直接返回；过期或不存在时探测一次；若已有探测在跑则等那一次完成而不是抢跑。需要可执行文件路径时（例如 python、node 的条目）用它，不要靠猜 PATH 或另跑 where/which。只想知道差异时用 env_refresh。',
@@ -610,6 +641,75 @@ function refreshReply(result, t) {
     const head = `${t.cmdRefreshed} (${t.probedAt} ${result.report.probedAt})`;
     if (isEmptyDiff(result.diff)) return `${head}: ${t.noChanges}`;
     return `${head}\n${renderDiff(result.diff)}`;
+}
+
+/** Bound for the collapsed one-line context account (`notice` form summary). */
+const CONTEXT_SUMMARY_MAX_CHARS = 120;
+
+/** Collapse whitespace and bound one context summary to the producer contract. */
+function boundSummary(text) {
+    const one = (text || '').replace(/\s+/g, ' ').trim();
+    return one.length <= CONTEXT_SUMMARY_MAX_CHARS
+        ? one
+        : `${one.slice(0, CONTEXT_SUMMARY_MAX_CHARS - 1)}…`;
+}
+
+/**
+ * The model-facing account of one `/env-refresh` run, as a producer supplied
+ * context message: `<system-reminder>` text plus the one-line summary the Chat
+ * shows while the row is collapsed. Built even when the probe failed, so the
+ * model learns that the snapshot it holds is no longer trusted.
+ * @returns {{ summary: string, text: string }}
+ */
+function buildRefreshNotice(result, t) {
+    if (!result.ok) {
+        return {
+            summary: boundSummary(`${t.cmdProbeFailed}: ${result.error || ''}`),
+            text: `<system-reminder>\n${t.noticeFailed}\n${result.error || ''}\n</system-reminder>`,
+        };
+    }
+    const probedAt = result.report.probedAt;
+    const diff = result.diff || { added: [], removed: [], changed: [] };
+    const empty = isEmptyDiff(diff);
+    const counts = `+${diff.added.length} -${diff.removed.length} ~${diff.changed.length}`;
+    const summary = boundSummary(empty ? `${probedAt} · ${t.noChanges}` : `${probedAt} · ${counts}`);
+    const body = empty
+        ? `- ${t.noChanges}`
+        : `${t.noticeChanges}\n${renderDiff(diff)}`;
+    return {
+        summary,
+        text: `<system-reminder>\n${t.noticeIntro}\n${t.probedAt}: ${probedAt}\n${body}\n${t.noticeHint}\n</system-reminder>`,
+    };
+}
+
+/**
+ * Hand a command outcome to the receiving agent as a producer supplied
+ * context message. `dsh-commands` never forwards a command or its result to
+ * the model, so this is what puts `/env-refresh` into the conversation: the
+ * Chat renders it as a "Context injection · env-probe" row and the model
+ * reads it in the next step.
+ * @returns whether the message was accepted by the agent.
+ */
+function sendCommandNotice(agent, result, cfg, t, warn) {
+    if (cfg.notifyModel === 'off' || !agent) return false;
+    const notice = buildRefreshNotice(result, t);
+    // Shape mirrors @deepseek-ai/dsh-llm `createUserMessage` without the
+    // dependency: an identified user message whose producer-declared source
+    // carries the `notice` form and its bounded one-line account.
+    const message = {
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: notice.text }],
+        source: { kind: 'env-probe', form: 'notice', summary: notice.summary },
+    };
+    try {
+        if (cfg.notifyModel === 'inject' && typeof agent.inject === 'function') agent.inject(message);
+        else agent.steer(message);
+        return true;
+    } catch (e) {
+        warn(`/env-refresh could not notify the model: ${(e && e.message) || e}`);
+        return false;
+    }
 }
 
 /** Structured snapshot handed to `env_probe` (and to PTC code reading it). */
@@ -760,10 +860,14 @@ export function apply(ctx, config) {
                 description: t.cmdRefreshDesc,
                 input: { hint: t.cmdHint },
                 recordInput: false,
-                handler: async () => {
+                handler: async ({ agent }) => {
                     const result = await reprobe();
+                    // The command plane is UI-only by contract; forward the
+                    // outcome to the model explicitly (see sendCommandNotice).
+                    const notified = sendCommandNotice(agent, result, cfg, t, warn);
                     if (!result.ok) return { kind: 'error', text: `${t.cmdProbeFailed}: ${result.error}` };
-                    return { kind: 'success', text: refreshReply(result, t) };
+                    const text = refreshReply(result, t);
+                    return { kind: 'success', text: notified ? `${text}\n${t.cmdNotified}` : text };
                 },
             });
         });
