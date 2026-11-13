@@ -1,16 +1,19 @@
-// dsh-env-probe (v1.1.x, local fork)
+// dsh-env-probe (v1.2.x, local fork)
 // Zero-dependency DeepSeek Harness (dsh) plugin: probe the local machine
 // environment once, cache the report on disk, and inject it into every
 // session's system prompt so the agent does not have to guess what this
 // computer offers (OS, shells, runtimes, tools, disks, proxy).
 //
-// v1.1.0 (local fork) changes:
+// Local-fork changes (on top of upstream v1.0.1):
 //   - /env-refresh now returns ONLY the diff against the previous probe, never
 //     the whole report, and blocks while a background probe is in flight
-//     instead of answering from a stale cache.
+//     instead of answering from an older cache.
 //   - /env-suggest is gone (it steered the agent and burned tokens silently).
 //   - new `env_refresh` tool for the model: same blocking refresh, same
 //     diff-only answer, and it rewrites the cache the injected section reads.
+//   - new `env_probe` tool: the cached snapshot as structured data (one entry
+//     per runtime/tool with path and version), no probe spawned, so a PTC /
+//     `run_code` agent can read a path and call it directly.
 //   - the version-probe commands, executable aliases and shell list are now
 //     configuration (`versionArgs` / `execAliases` / `shells`) instead of
 //     hard-coded tables.
@@ -19,6 +22,10 @@
 //     date, and they name the tool that refreshes it.
 //   - extensionless POSIX-style shims found on PATH (npm/pnpm) are resolved
 //     to their runnable .cmd sibling so the version probe actually runs.
+//   - the diff tells a version bump (`~ name: old -> new`) apart from an
+//     executable that moved on PATH (`~ name (path): old -> new`).
+//   - v1.2.0: `cacheTtlHours` defaults to 1 and the expired-cache notice is
+//     gone - the header always states the probe time and its age instead.
 //
 // Generic by design: no machine-specific endpoints, no local-service checks,
 // every probe item is configurable. Read-only commands only.
@@ -94,7 +101,7 @@ const DEFAULT_SHELLS = IS_WIN
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,63}$/;
 
 const DEFAULTS = {
-    cacheTtlHours: 168,
+    cacheTtlHours: 1,
     order: 30,
     language: 'en',
     cacheDir: '~/.dsh-env-probe',
@@ -109,29 +116,107 @@ const DEFAULTS = {
     marker: 'ENV-PROBE',
 };
 
-export const TOOL_NAME = 'env_refresh';
+export const REFRESH_TOOL = 'env_refresh';
+export const PROBE_TOOL = 'env_probe';
 
-// The tool definition is a plain registry-ready object: `ctx.tools.register`
+// Tool definitions are plain registry-ready objects: `ctx.tools.register`
 // validates `output.render` and `output.schema` itself, so importing
 // `@deepseek-ai/dsh-tools` (not resolvable from a profile plugin) is not
-// required and this stays dependency-free.
-const TOOL_PARAMETERS = Object.freeze({
+// required and this stays dependency-free. Both tools answer with structured
+// data (not prose) so a PTC / `run_code` agent can read a path out of the
+// result and call it directly.
+const NO_PARAMS = Object.freeze({ type: 'object', additionalProperties: false, properties: {} });
+
+/** One probed executable, used both in snapshots and in diffs. */
+const ENTRY_SCHEMA = Object.freeze({
     type: 'object',
     additionalProperties: false,
-    properties: {},
+    properties: {
+        name: { type: 'string' },
+        kind: { type: 'string', enum: ['runtime', 'tool'] },
+        available: { type: 'boolean' },
+        path: { type: 'string' },
+        version: { type: 'string' },
+    },
+    required: ['name', 'kind', 'available', 'path', 'version'],
 });
 
-const TOOL_OUTPUT_SCHEMA = Object.freeze({
+/** One changed entry: which side moved and between what. */
+const CHANGE_SCHEMA = Object.freeze({
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        name: { type: 'string' },
+        kind: { type: 'string', enum: ['version', 'path'] },
+        from: { type: 'string' },
+        to: { type: 'string' },
+    },
+    required: ['name', 'kind', 'from', 'to'],
+});
+
+const DIFF_PROPERTIES = Object.freeze({
+    added: { type: 'array', items: ENTRY_SCHEMA },
+    removed: { type: 'array', items: { type: 'string' } },
+    changed: { type: 'array', items: CHANGE_SCHEMA },
+});
+
+const REFRESH_OUTPUT_SCHEMA = Object.freeze({
     type: 'object',
     additionalProperties: false,
     properties: {
         ok: { type: 'boolean' },
         probedAt: { type: 'string' },
         summary: { type: 'string' },
+        ...DIFF_PROPERTIES,
         error: { type: 'string' },
     },
-    required: ['ok', 'probedAt', 'summary'],
+    required: ['ok', 'probedAt', 'summary', 'added', 'removed', 'changed'],
 });
+
+const PROBE_OUTPUT_SCHEMA = Object.freeze({
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        ok: { type: 'boolean' },
+        probedAt: { type: 'string' },
+        ageSeconds: { type: 'integer' },
+        os: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+                name: { type: 'string' },
+                arch: { type: 'string' },
+                cpus: { type: 'integer' },
+                memoryGB: { type: 'number' },
+            },
+            required: ['name', 'arch', 'cpus', 'memoryGB'],
+        },
+        shell: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+                current: { type: 'string' },
+                available: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['current', 'available'],
+        },
+        entries: { type: 'array', items: ENTRY_SCHEMA },
+        disks: { type: 'array', items: { type: 'string' } },
+        proxy: { type: 'array', items: { type: 'string' } },
+        error: { type: 'string' },
+    },
+    required: ['ok', 'probedAt', 'ageSeconds', 'os', 'shell', 'entries', 'disks', 'proxy'],
+});
+
+function toEntry(item, kind) {
+    return {
+        name: item.name,
+        kind,
+        available: item.available === true,
+        path: item.path || '',
+        version: item.version || '',
+    };
+}
 
 export const Config = {
     '~standard': {
@@ -379,15 +464,16 @@ const L = {
         disks: 'Disks', proxy: 'Proxy Environment', none: 'none detected',
         current: 'current', probedAt: 'probed at', unavailable: 'unavailable',
         ageNow: 'just now', ageMinutes: '{n} min ago', ageHours: '{n} h ago', ageDays: '{n} d ago',
-        stale: '(cache expired: re-probing in the background, values below are from the older probe)',
         noReport: 'The environment probe has not finished yet or failed. Assume a generic environment and verify before relying on it.',
         cmdRefreshDesc: 're-probe the local environment, rewrite the cache, and return only what changed since the previous probe',
         cmdHint: 'no arguments; press Enter',
         cmdRefreshed: 'Environment snapshot refreshed',
         cmdProbeFailed: 'environment probe failed',
         noChanges: 'no changes since the previous probe',
-        toolDesc: 'Re-probe this machine\'s environment now (OS, shells, runtimes, tools, disks, proxy), rewrite the cached snapshot that is injected into the system prompt, and return ONLY the diff against the previous probe. Blocks until the probe finishes when one is already running. Call it after installing, upgrading or removing a tool, or when a path or version from the injected ENV-PROBE snapshot no longer matches reality. Read-only: it never installs anything.',
+        toolDesc: 'Re-probe this machine\'s environment now (OS, shells, runtimes, tools, disks, proxy), rewrite the cached snapshot that is injected into the system prompt, and return ONLY the diff against the previous probe as structured data (added / removed / changed). Blocks until an already-running probe finishes. Call it after installing, upgrading or removing a tool, or when a path or version from the injected ENV-PROBE snapshot no longer matches reality. Read-only: it never installs anything.',
         toolNoArgs: 'Takes no arguments.',
+        probeDesc: 'Read the current machine environment snapshot as structured data: OS, shell, disks, proxy, and one entry per configured runtime and tool with name, kind, available, path and version. No probe is spawned - it answers from the cached snapshot, waiting for a background probe that is already running. Use it to resolve an executable path (e.g. the python or node entry) before calling another tool, instead of guessing PATH or shelling out to `where`/`which`. Call env_refresh instead when you need fresh facts.',
+        probeUnavailable: 'no environment snapshot available yet',
     },
     zh: {
         title: '本机环境快照',
@@ -399,15 +485,16 @@ const L = {
         disks: '磁盘', proxy: '代理环境变量', none: '未检测到',
         current: '当前', probedAt: '探测于', unavailable: '未探测到',
         ageNow: '刚刚', ageMinutes: '{n} 分钟前', ageHours: '{n} 小时前', ageDays: '{n} 天前',
-        stale: '（缓存已过期，正在后台重探，以下为更早一次的探测结果）',
         noReport: '环境探测尚未完成或已失败。先按通用环境处理，并在依赖这些信息前核实。',
         cmdRefreshDesc: '重新探测本机环境、重写缓存，只返回与上次探测的差异',
         cmdHint: '无需参数，直接回车',
         cmdRefreshed: '环境快照已刷新',
         cmdProbeFailed: '环境探测失败',
         noChanges: '较上次探测无变化',
-        toolDesc: '立即重新探测本机环境（系统、shell、运行时、工具、磁盘、代理），重写注入到系统提示词里的环境快照缓存，只返回与上次探测的差异。已有探测在进行时会阻塞等待其完成。安装、升级、卸载工具后，或注入的 ENV-PROBE 快照中的路径/版本与实际不符时调用。只读操作，不会安装任何东西。',
+        toolDesc: '立即重新探测本机环境（系统、shell、运行时、工具、磁盘、代理），重写注入到系统提示词里的环境快照缓存，只返回与上次探测的差异（结构化 added / removed / changed）。已有探测在进行时会阻塞等待其完成。安装、升级、卸载工具后，或注入的 ENV-PROBE 快照中的路径/版本与实际不符时调用。只读操作，不会安装任何东西。',
         toolNoArgs: '无参数。',
+        probeDesc: '以结构化数据读取当前的本机环境快照：系统、shell、磁盘、代理，以及每个已配置运行时与工具的名称、kind、available、path、version。不会触发探测——直接读缓存，若后台正在探测则等待其完成。需要可执行文件路径时（例如 python、node 的条目）用它，不要靠猜 PATH 或另跑 where/which。需要最新事实时改用 env_refresh。',
+        probeUnavailable: '当前还没有可用的环境快照',
     },
 };
 
@@ -422,11 +509,11 @@ function ageText(iso, t) {
     return t.ageDays.replace('{n}', String(Math.round(hours / 24)));
 }
 
-function renderMarkdown(report, cfg, stale, toolAvailable) {
+function renderMarkdown(report, cfg, toolAvailable) {
     const t = L[cfg.language] || L.en;
     const age = ageText(report.probedAt, t);
     const lines = [
-        `${cfg.marker}: ${t.title} (${t.probedAt} ${report.probedAt}${age ? `, ${age}` : ''})${stale ? ' ' + t.stale : ''}`,
+        `${cfg.marker}: ${t.title} (${t.probedAt} ${report.probedAt}${age ? `, ${age}` : ''})`,
         t.intro,
         toolAvailable ? t.refreshHint : t.refreshHintNoTool,
         t.unavailableNote,
@@ -471,11 +558,12 @@ function diffReports(oldReport, newReport) {
     const diff = { added: [], removed: [], changed: [] };
     if (!oldReport) return diff;
     for (const key of ['runtimes', 'tools']) {
+        const kind = key === 'runtimes' ? 'runtime' : 'tool';
         const oldMap = new Map((oldReport[key] || []).map(i => [i.name, i]));
         for (const item of newReport[key] || []) {
             const prev = oldMap.get(item.name);
             if (!prev || !prev.available) {
-                if (item.available) diff.added.push(item);
+                if (item.available) diff.added.push(toEntry(item, kind));
                 continue;
             }
             if (!item.available) { diff.removed.push(item.name); continue; }
@@ -517,6 +605,56 @@ function refreshReply(result, t) {
     return `${head}\n${renderDiff(result.diff)}`;
 }
 
+/** Structured snapshot handed to `env_probe` (and to PTC code reading it). */
+function snapshotValue(report) {
+    const o = report.os || {};
+    const sh = report.shells || {};
+    const ageSeconds = Math.round((Date.now() - Date.parse(report.probedAt)) / 1000);
+    return {
+        ok: true,
+        probedAt: report.probedAt,
+        ageSeconds: Number.isFinite(ageSeconds) && ageSeconds > 0 ? ageSeconds : 0,
+        os: {
+            name: o.pretty || o.type || '',
+            arch: o.arch || '',
+            cpus: Number.isInteger(o.cpus) ? o.cpus : 0,
+            memoryGB: Number.isFinite(o.totalMemGB) ? o.totalMemGB : 0,
+        },
+        shell: { current: sh.current || '', available: Array.isArray(sh.available) ? sh.available : [] },
+        entries: [
+            ...(report.runtimes || []).map(i => toEntry(i, 'runtime')),
+            ...(report.tools || []).map(i => toEntry(i, 'tool')),
+        ],
+        disks: Array.isArray(report.disks) ? report.disks : [],
+        proxy: Object.entries(report.proxy || {}).map(([k, v]) => `${k}=${v}`),
+    };
+}
+
+function probeFailure(error) {
+    return {
+        ok: false,
+        probedAt: '',
+        ageSeconds: 0,
+        os: { name: '', arch: '', cpus: 0, memoryGB: 0 },
+        shell: { current: '', available: [] },
+        entries: [],
+        disks: [],
+        proxy: [],
+        error: error || '',
+    };
+}
+
+function probeText(value, t) {
+    if (!value.ok) return `${t.probeUnavailable}${value.error ? `: ${value.error}` : ''}`;
+    const available = value.entries.filter(e => e.available);
+    const lines = [
+        `${value.probedAt} | ${value.os.name} | ${value.os.arch} | CPU ${value.os.cpus} | RAM ${value.os.memoryGB} GB`,
+        `${available.length}/${value.entries.length} available`,
+    ];
+    for (const e of value.entries) lines.push(e.available ? `${e.name}: ${e.path}` : `${e.name}: -`);
+    return lines.join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // Plugin entry
 // ---------------------------------------------------------------------------
@@ -529,7 +667,7 @@ export function apply(ctx, config) {
     const mdPath = join(dir, 'env-profile.md');
 
     // Live state served by the section provider (evaluated at each assembly).
-    const state = { report: null, stale: false, inflight: null, lastError: null, toolAvailable: false };
+    const state = { report: null, inflight: null, lastError: null, toolAvailable: false };
 
     const warn = (message) => {
         try { ctx.logger?.warn?.(message); } catch { /* logging is best-effort */ }
@@ -550,7 +688,7 @@ export function apply(ctx, config) {
 
     // Single-flight, blocking re-probe. Callers (boot, TTL check, /env-refresh,
     // the env_refresh tool) all join the same in-flight run and are resolved
-    // only by a probe that actually completed - never by the stale cache.
+    // only by a probe that actually completed - never by the older cache.
     function reprobe() {
         if (state.inflight) return state.inflight;
         const job = (async () => {
@@ -559,9 +697,8 @@ export function apply(ctx, config) {
                 const report = await probeEnvironment(cfg);
                 mkdirSync(dir, { recursive: true });
                 writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-                writeFileSync(mdPath, renderMarkdown(report, cfg, false, state.toolAvailable));
+                writeFileSync(mdPath, renderMarkdown(report, cfg, state.toolAvailable));
                 state.report = report;
-                state.stale = false;
                 state.lastError = null;
                 return { ok: true, report, diff: diffReports(oldReport, report) };
             } catch (e) {
@@ -575,13 +712,13 @@ export function apply(ctx, config) {
         return job;
     }
 
-    // Boot: serve a fresh cache immediately; otherwise probe in background.
+    // Boot: serve the cache immediately (however old); a cache past its TTL
+    // only triggers a silent background re-probe. There is no "expired" state
+    // to render: the header always states when the snapshot was taken.
     const cached = readCache();
-    if (cached && cached.fresh) {
-        state.report = cached.report;
-    } else {
-        if (cached) { state.report = cached.report; state.stale = true; }
-        reprobe(); // fire and forget; section provider picks it up on later assemblies
+    if (cached) state.report = cached.report;
+    if (!cached || !cached.fresh) {
+        reprobe(); // fire and forget; the section provider picks it up on later assemblies
     }
 
     ctx.systemPrompt.section({
@@ -592,16 +729,13 @@ export function apply(ctx, config) {
             if (!state.inflight) {
                 try {
                     const mtime = statSync(jsonPath).mtimeMs;
-                    if (Date.now() - mtime > cfg.cacheTtlHours * 3600_000) {
-                        state.stale = true;
-                        reprobe();
-                    }
+                    if (Date.now() - mtime > cfg.cacheTtlHours * 3600_000) reprobe();
                 } catch { /* no cache file yet: boot probe already running */ }
             }
             if (!state.report) {
                 return `${cfg.marker}: ${t.noReport}${state.lastError ? ` (${state.lastError})` : ''}`;
             }
-            return renderMarkdown(state.report, cfg, state.stale, state.toolAvailable);
+            return renderMarkdown(state.report, cfg, state.toolAvailable);
         },
     });
 
@@ -626,40 +760,77 @@ export function apply(ctx, config) {
     }
 
     // -----------------------------------------------------------------------
-    // env_refresh tool for the model: same blocking refresh, diff-only answer.
-    // Registered as a plain registry-ready definition because
+    // Tools for the model. Both answer with structured data so a PTC /
+    // `run_code` agent can read a path out of the result and call it directly.
+    // Registered as plain registry-ready definitions because
     // `ctx.tools.register` validates the shape itself.
     // -----------------------------------------------------------------------
     if (typeof ctx.inject === 'function') {
         ctx.inject(['tools'], (toolCtx) => {
-            const tool = {
-                name: TOOL_NAME,
+            const refreshTool = {
+                name: REFRESH_TOOL,
                 description: `${t.toolDesc}\n${t.toolNoArgs}`,
-                parameters: TOOL_PARAMETERS,
+                parameters: NO_PARAMS,
                 output: {
-                    schema: TOOL_OUTPUT_SCHEMA,
+                    schema: REFRESH_OUTPUT_SCHEMA,
                     render: (_args, value) => [{ type: 'text', text: value.summary }],
                 },
                 timeoutMs: cfg.totalTimeoutMs + 5000,
                 async execute() {
                     const result = await reprobe();
                     if (!result.ok) {
-                        return { ok: false, probedAt: '', summary: `${t.cmdProbeFailed}: ${result.error}`, error: result.error };
+                        return {
+                            ok: false, probedAt: '', summary: `${t.cmdProbeFailed}: ${result.error}`, error: result.error,
+                            added: [], removed: [], changed: [],
+                        };
                     }
                     return {
                         ok: true,
                         probedAt: result.report.probedAt,
                         summary: refreshReply(result, t),
+                        added: result.diff.added,
+                        removed: result.diff.removed,
+                        changed: result.diff.changed,
                     };
                 },
             };
-            try {
-                toolCtx.tools.register(tool);
-                state.toolAvailable = true;
-            } catch (e) {
-                state.toolAvailable = false;
-                warn(`env_refresh tool not registered: ${(e && e.message) || e}`);
+
+            const probeTool = {
+                name: PROBE_TOOL,
+                description: `${t.probeDesc}\n${t.toolNoArgs}`,
+                parameters: NO_PARAMS,
+                output: {
+                    schema: PROBE_OUTPUT_SCHEMA,
+                    render: (_args, value) => [{ type: 'text', text: probeText(value, t) }],
+                },
+                timeoutMs: cfg.totalTimeoutMs + 5000,
+                async execute() {
+                    let report = state.report;
+                    // Never answer from the cache while a fresh probe is landing:
+                    // wait for the in-flight run instead of racing it.
+                    if (state.inflight) {
+                        const inFlight = await state.inflight;
+                        if (inFlight.ok) report = inFlight.report;
+                    }
+                    if (!report) {
+                        const result = await reprobe();
+                        if (!result.ok) return probeFailure(result.error);
+                        report = result.report;
+                    }
+                    return snapshotValue(report);
+                },
+            };
+
+            let refreshRegistered = false;
+            for (const tool of [refreshTool, probeTool]) {
+                try {
+                    toolCtx.tools.register(tool);
+                    if (tool.name === REFRESH_TOOL) refreshRegistered = true;
+                } catch (e) {
+                    warn(`${tool.name} tool not registered: ${(e && e.message) || e}`);
+                }
             }
+            state.toolAvailable = refreshRegistered;
         });
     }
 }
