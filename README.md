@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environment (OS / shells / runtimes / tools / disks / proxy) once, caches the report on disk, injects it as an ordered system-prompt section, and exposes the same facts to the model as tools.
+Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environment (OS / shells / runtimes / tools / disks / proxy) once, caches the report on disk, exposes the same facts to the model as tools, and optionally injects it as an ordered system-prompt section.
 
 > **Local fork (v1.4.x)** of [nodata404/dsh-env-probe](https://github.com/nodata404/dsh-env-probe) v1.0.1. Changes are listed under "Changes since 1.0.1".
 
@@ -10,8 +10,10 @@ Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environm
 
 | `injectSection` | What happens | Prompt cost |
 |---|---|---|
-| `true` (default) | the snapshot is injected as a system-prompt section | a fixed block, stable for the whole TTL |
-| `false` | **tool-only**: nothing is ever injected | zero |
+| `false` (default) | **tool-only**: nothing is ever injected | zero |
+| `true` | the snapshot is injected as a system-prompt section | a fixed block, stable for the whole TTL |
+
+Tool-only is the default: the model reads what it needs through `env_probe` / `env_refresh`, the system prompt stays byte-identical, and a fact refresh cannot bust the provider's prompt cache. Turn `injectSection` on only when every turn genuinely needs the snapshot in the prompt.
 
 Injected text is deliberately *frozen* between probes: the header carries only the absolute probe time, never a relative "16 min ago". A ticking suffix would rewrite the system prompt every minute, invalidating the provider's prompt cache on every turn — which costs far more than the section itself.
 
@@ -49,8 +51,8 @@ There is no "cache expired" marker either: an expired cache only triggers a sile
 
 | `notifyModel` | Behaviour |
 |---|---|
-| `'steer'` (default) | submit the notice and wake the agent, so it answers the refresh right away |
-| `'inject'` | submit the notice only; it lands in the next accepted step without waking an idle agent |
+| `'inject'` (default) | submit the notice only; it lands in the next accepted step without waking an idle agent |
+| `'steer'` | submit the notice and wake the agent, so it answers the refresh right away |
 | `'off'` | UI-only result, the pre-1.4 behaviour |
 
 A failed probe injects a failure notice instead, so the model stops trusting the old snapshot.
@@ -99,11 +101,11 @@ Structured part: `added: [{name, kind, available, path, version}]`, `removed: [n
 | Key | Default | Meaning |
 |---|---|---|
 | `cacheTtlHours` | `24` | cache lifetime; an expired cache only triggers a silent background re-probe |
-| `injectSection` | `true` | register the system-prompt section; `false` = tool-only, zero prompt cost |
-| `notifyModel` | `'steer'` | how `/env-refresh` reaches the model: `'steer'` inject and wake, `'inject'` inject only, `'off'` UI only |
+| `injectSection` | `false` | register the system-prompt section; default `false` = tool-only, zero prompt cost |
+| `notifyModel` | `'inject'` | how `/env-refresh` reaches the model: `'inject'` inject only, `'steer'` inject and wake, `'off'` UI only |
 | `order` | `30` | system-prompt section order |
 | `language` | `'en'` | injected text language: `'en'` / `'zh'` |
-| `cacheDir` | `'~/.dsh-env-probe'` | cache directory (`env-profile.json` + `env-profile.md`) |
+| `cacheDir` | `'~/.dsh/cache/dsh-env-probe'` | cache directory (`env-profile.json` + `env-profile.md`) |
 | `runtimes` | git, node, npm, python, python3, pip, docker, java, go, rustc | probed runtimes (replaces the default list) |
 | `tools` | curl, wget, ffmpeg, 7z, pandoc, tar, unzip, make, gcc, pwsh | probed tools (replaces the default list) |
 | `shells` | Windows: pwsh, powershell, cmd, bash; POSIX: bash, zsh, sh, fish, pwsh | probed shells |
@@ -134,8 +136,8 @@ Example (profile `cordis.patch.yml`):
   config:
     language: en
     cacheTtlHours: 24
-    injectSection: true        # false = tools only, nothing in the prompt
-    notifyModel: steer         # /env-refresh result: steer wakes, inject only queues, off is UI-only
+    injectSection: false       # default tool-only; true = also inject a prompt section
+    notifyModel: inject        # /env-refresh result: inject only queues, steer wakes, off is UI-only
     runtimes: [git, node, npm, pnpm, uv, dotnet, python, pip, java, go, rustc, docker]
     tools: [7z, just, sqlite3, curl, wget, ffmpeg, tar, unzip, make, gcc, pwsh]
     versionArgs:
@@ -156,7 +158,8 @@ Example (profile `cordis.patch.yml`):
 9. **The diff distinguishes kinds of change**: a version bump renders as `~ name: old -> new`, a relocated executable as `~ name (path): old -> new`.
 10. **TTL defaults to 24 hours**, the "cache expired" notice is gone, and `injectSection` can turn injection off entirely.
 11. **No relative age in the injected header**: only the absolute probe time, so the system prompt stays byte-identical until the snapshot is actually rewritten (prompt-cache friendly).
-12. **`/env-refresh` now reaches the model**: the handler hands the diff to the agent as a `form: 'notice'` context message, so the Chat shows "Context injection · env-probe" and the model sees the result. `notifyModel` (`steer` / `inject` / `off`) picks the wake policy; the default is `steer`.
+12. **`/env-refresh` now reaches the model**: the handler hands the diff to the agent as a `form: 'notice'` context message, so the Chat shows "Context injection · env-probe" and the model sees the result. `notifyModel` (`inject` / `steer` / `off`) picks the wake policy; the default is `inject`.
+13. **Tool-only by default**: `injectSection` now defaults to `false`, `notifyModel` to `inject`, and the cache moved to `~/.dsh/cache/dsh-env-probe` alongside the other harness caches. The default configuration touches neither the system prompt nor the model's wake state.
 
 ## Plugin contract
 

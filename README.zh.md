@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-零依赖 DeepSeek Harness 插件：探测一次本机环境（操作系统 / Shell / 运行时 / 常用工具 / 磁盘 / 代理），缓存到磁盘，既可注入系统提示词，也把同一份事实以工具形式交给模型。
+零依赖 DeepSeek Harness 插件：探测一次本机环境（操作系统 / Shell / 运行时 / 常用工具 / 磁盘 / 代理），缓存到磁盘，把同一份事实以工具形式交给模型，并可选择作为系统提示词的一段注入。
 
 > **本仓库是本地分支（v1.4.x）**，基于 [nodata404/dsh-env-probe](https://github.com/nodata404/dsh-env-probe) v1.0.1，改动见下方「相对 1.0.1 的改动」。
 
@@ -10,8 +10,10 @@
 
 | `injectSection` | 行为 | 提示词开销 |
 |---|---|---|
-| `true`（默认） | 快照作为系统提示词的一段注入 | 一段固定内容，整个 TTL 内不变 |
-| `false` | **纯工具模式**：完全不注入 | 零 |
+| `false`（默认） | **纯工具模式**：完全不注入 | 零 |
+| `true` | 快照作为系统提示词的一段注入 | 一段固定内容，整个 TTL 内不变 |
+
+默认是纯工具模式：模型通过 `env_probe` / `env_refresh` 按需读取，系统提示词逐字节不变，prompt cache 不会被事实刷新打穿。只有在"每轮都必须知道这份快照"时才打开 `injectSection`。
 
 注入内容在两次探测之间是**冻结**的：标题只写绝对探测时间，不写"16 分钟前"这种相对年龄。相对年龄每分钟都在变，会让系统提示词每轮都被改写，把上游的 prompt cache 每轮打穿——那比这段文字本身贵得多。
 
@@ -49,8 +51,8 @@ ENV-PROBE: 本机环境快照 (探测于 2026-11-13T21:43:45.862Z)
 
 | `notifyModel` | 行为 |
 |---|---|
-| `'steer'`（默认） | 提交通知并唤醒 agent，模型立即回应这次刷新 |
-| `'inject'` | 只提交通知、不唤醒；落到下一次被接纳的步骤里 |
+| `'inject'`（默认） | 只提交通知、不唤醒；落到下一次被接纳的步骤里 |
+| `'steer'` | 提交通知并唤醒 agent，模型立即回应这次刷新 |
 | `'off'` | 只在 UI 显示结果（1.4 之前的行为） |
 
 探测失败时同样注入一条失败通知，避免模型继续相信旧快照。
@@ -99,11 +101,11 @@ const python = env.entries.find((e) => e.name === 'python' && e.available);
 | 键 | 默认值 | 含义 |
 |---|---|---|
 | `cacheTtlHours` | `24` | 缓存有效期（小时），过期后静默后台重探 |
-| `injectSection` | `true` | 是否注册系统提示词段；`false` = 纯工具模式，零提示词开销 |
-| `notifyModel` | `'steer'` | `/env-refresh` 结果如何进模型上下文：`'steer'` 注入并唤醒、`'inject'` 只注入不唤醒、`'off'` 仅 UI |
+| `injectSection` | `false` | 是否注册系统提示词段；默认 `false` = 纯工具模式，零提示词开销 |
+| `notifyModel` | `'inject'` | `/env-refresh` 结果如何进模型上下文：`'inject'` 只注入、`'steer'` 注入并唤醒、`'off'` 仅 UI |
 | `order` | `30` | 系统提示词段顺序 |
 | `language` | `'en'` | 注入文本语言：`'en'` / `'zh'` |
-| `cacheDir` | `'~/.dsh-env-probe'` | 缓存目录（`env-profile.json` + `env-profile.md`） |
+| `cacheDir` | `'~/.dsh/cache/dsh-env-probe'` | 缓存目录（`env-profile.json` + `env-profile.md`） |
 | `runtimes` | git, node, npm, python, python3, pip, docker, java, go, rustc | 探测的运行时清单（整体替换默认值） |
 | `tools` | curl, wget, ffmpeg, 7z, pandoc, tar, unzip, make, gcc, pwsh | 探测的工具清单（整体替换默认值） |
 | `shells` | Windows: pwsh, powershell, cmd, bash；POSIX: bash, zsh, sh, fish, pwsh | 探测的 shell 清单 |
@@ -134,8 +136,8 @@ execAliases  = {
   config:
     language: zh
     cacheTtlHours: 24
-    injectSection: true        # false = 只留工具，不注入提示词
-    notifyModel: steer         # /env-refresh 结果：steer 唤醒 / inject 只注入 / off 仅 UI
+    injectSection: false       # 默认纯工具；true = 额外注入提示词段
+    notifyModel: inject        # /env-refresh 结果：inject 只注入 / steer 唤醒 / off 仅 UI
     runtimes: [git, node, npm, pnpm, uv, dotnet, python, pip, java, go, rustc, docker]
     tools: [7z, just, sqlite3, curl, wget, ffmpeg, tar, unzip, make, gcc, pwsh]
     versionArgs:
@@ -156,7 +158,8 @@ execAliases  = {
 9. **差异区分变化类型**：版本变化 `~ 名字: 旧 -> 新`，可执行文件换位置 `~ 名字 (path): 旧 -> 新`。
 10. **TTL 默认 24 小时**，删掉"缓存已过期"提示，并新增 `injectSection` 可整体关闭注入。
 11. **注入标题不再带相对年龄**：只写绝对探测时间，因此快照不重写时系统提示词逐字节不变（对 prompt cache 友好）。
-12. **`/env-refresh` 结果进入模型上下文**：命令不再只在 UI 收尾；handler 把差异作为 `form: 'notice'` 的上下文消息交给 agent，Chat 显示为「上下文注入 · env-probe」，模型能看到刷新结果。新增 `notifyModel`（`steer` / `inject` / `off`）控制唤醒策略，默认 `steer`。
+12. **`/env-refresh` 结果进入模型上下文**：命令不再只在 UI 收尾；handler 把差异作为 `form: 'notice'` 的上下文消息交给 agent，Chat 显示为「上下文注入 · env-probe」，模型能看到刷新结果。新增 `notifyModel`（`inject` / `steer` / `off`）控制唤醒策略，默认 `inject`。
+13. **默认纯工具模式**：`injectSection` 默认改为 `false`、`notifyModel` 默认 `inject`，缓存迁到 `~/.dsh/cache/dsh-env-probe`（与其他 harness 缓存同处）。默认配置不碰系统提示词，也不唤醒模型。
 
 ## 插件契约
 

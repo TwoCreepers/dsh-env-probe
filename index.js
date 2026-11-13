@@ -38,9 +38,13 @@
 //     supplied context message (`source.kind = 'env-probe'`,
 //     `form: 'notice'`): the Chat renders it as the collapsed "Context
 //     injection · env-probe" row and the model reads it in the next step.
-//     `notifyModel` picks `steer` (wake the agent and answer), `inject` (add
-//     it to the next accepted step without waking) or `off` (UI only, the
-//     v1.3.0 behavior). A probe failure is reported the same way.
+//     `notifyModel` picks `inject` (add it to the next accepted step without
+//     waking the agent), `steer` (wake the agent and answer) or `off` (UI
+//     only, the v1.3.0 behavior). A probe failure is reported the same way.
+//   - v1.4.1: tool-only by default. `injectSection` defaults to false,
+//     `notifyModel` to `inject`, and the cache lives under
+//     `~/.dsh/cache/dsh-env-probe` with the rest of the harness caches.
+//     Nothing touches the system prompt unless the profile opts in.
 //
 // Generic by design: no machine-specific endpoints, no local-service checks,
 // every probe item is configurable. Read-only commands only.
@@ -63,11 +67,11 @@
 //   - id: env-probe
 //     config:
 //       cacheTtlHours: 168        # re-probe when the cache is older
-//       injectSection: true       # false = tools only, nothing injected
-//       notifyModel: 'steer'      # /env-refresh context: 'steer' | 'inject' | 'off'
+//       injectSection: false      # true = also inject a system-prompt section
+//       notifyModel: 'inject'     # /env-refresh context: 'inject' | 'steer' | 'off'
 //       order: 30                 # systemPrompt section order
 //       language: 'en'            # section text language: 'en' | 'zh'
-//       cacheDir: '~/.dsh-env-probe'
+//       cacheDir: '~/.dsh/cache/dsh-env-probe'
 //       runtimes: ['git','node','python']   # override the default list
 //       tools: ['curl','ffmpeg']            # override the default list
 //       shells: ['pwsh','cmd']              # override the probed shell list
@@ -126,18 +130,19 @@ const DEFAULTS = {
     cacheTtlHours: 24,
     order: 30,
     language: 'en',
-    cacheDir: '~/.dsh-env-probe',
-    // Register the system-prompt section at all. `false` turns this into a
-    // tool-only plugin: nothing is injected, so every turn's prompt stays
-    // byte-identical and the provider-side prompt cache keeps hitting.
-    injectSection: true,
+    cacheDir: '~/.dsh/cache/dsh-env-probe',
+    // Register the system-prompt section at all. `false` (the default) keeps
+    // this a tool-only plugin: nothing is injected, so every turn's prompt
+    // stays byte-identical and the provider-side prompt cache keeps hitting.
+    // Set it to true only when the snapshot should be part of the prompt.
+    injectSection: false,
     // How `/env-refresh` hands its outcome to the model. The command plane
     // never reaches the model by itself, so this is the only path:
-    //   'steer'  - submit the result as context and wake the agent (it answers)
-    //   'inject' - submit the result as context only; it lands in the next step
-    //              the user or a tool starts, without waking an idle agent
+    //   'inject' - submit the result as context only; it lands in the next
+    //              accepted step without waking an idle agent (the default)
+    //   'steer'  - submit the result and wake the agent, so it answers
     //   'off'    - UI-only result, exactly the v1.3.0 behavior
-    notifyModel: 'steer',
+    notifyModel: 'inject',
     runtimes: DEFAULT_RUNTIMES,
     tools: DEFAULT_TOOLS,
     shells: DEFAULT_SHELLS,

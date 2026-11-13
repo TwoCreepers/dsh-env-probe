@@ -11,9 +11,12 @@
         language: en
         order: 30
         cacheTtlHours: 168
+        # Tool-only by default: nothing is added to the system prompt.
+        # Set it to true only when the snapshot should live in the prompt.
+        injectSection: false
         # /env-refresh hands its diff to the model as a `notice` context
-        # message; `steer` wakes the agent to answer it, `inject` only queues
-        # it for the next step, `off` keeps the result in the UI.
-        notifyModel: steer
+        # message; `inject` only queues it for the next step, `steer` wakes
+        # the agent to answer it, `off` keeps the result in the UI.
+        notifyModel: inject
         # runtimes / tools / shells / versionArgs / execAliases are optional;
         # see README for the configurable probe tables.
