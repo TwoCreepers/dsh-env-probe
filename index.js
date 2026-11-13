@@ -1,17 +1,24 @@
-// dsh-env-probe (v1.0.1)
+// dsh-env-probe (v1.1.x, local fork)
 // Zero-dependency DeepSeek Harness (dsh) plugin: probe the local machine
 // environment once, cache the report on disk, and inject it into every
 // session's system prompt so the agent does not have to guess what this
 // computer offers (OS, shells, runtimes, tools, disks, proxy).
 //
-// v1.0.1 adds two optional slash commands (registered only when the
-// `commands` service is composed, e.g. the Web UI; headless profiles keep
-// working without them):
-//   /env-refresh — force a re-probe now, rewrite the cache, and reply with
-//                  a summary plus a diff against the previous report
-//   /env-suggest — refresh first, then steer the agent to produce
-//                  environment optimization suggestions based on the
-//                  freshly injected profile (same pattern as /plan)
+// v1.1.0 (local fork) changes:
+//   - /env-refresh now returns ONLY the diff against the previous probe, never
+//     the whole report, and blocks while a background probe is in flight
+//     instead of answering from a stale cache.
+//   - /env-suggest is gone (it steered the agent and burned tokens silently).
+//   - new `env_refresh` tool for the model: same blocking refresh, same
+//     diff-only answer, and it rewrites the cache the injected section reads.
+//   - the version-probe commands, executable aliases and shell list are now
+//     configuration (`versionArgs` / `execAliases` / `shells`) instead of
+//     hard-coded tables.
+//   - the injected title/intro no longer argue that the report must be
+//     trusted; they state that it is a snapshot and may already be out of
+//     date, and they name the tool that refreshes it.
+//   - extensionless POSIX-style shims found on PATH (npm/pnpm) are resolved
+//     to their runnable .cmd sibling so the version probe actually runs.
 //
 // Generic by design: no machine-specific endpoints, no local-service checks,
 // every probe item is configurable. Read-only commands only.
@@ -22,6 +29,8 @@
 //     schema below (same interface zod/Schemastery wrap; implemented
 //     directly here to stay dependency-free).
 //   - `inject` declares required services: this plugin needs `systemPrompt`.
+//     `commands` and `tools` are consumed through `ctx.inject` so a
+//     composition without them keeps the prompt-injection half working.
 //   - ctx.systemPrompt.section({ name, order, text }) contributes an ordered
 //     system-prompt section; `text` may be a provider evaluated at every
 //     assembly, which is how the injected report stays fresh.
@@ -29,19 +38,23 @@
 //     100-199 tool guidance. This plugin defaults to 30 (environment layer).
 //
 // Config (via cordis.patch.yml):
-//   - insert:
-//       - id: env-probe
-//         name: 'file:///absolute/path/to/dsh-env-probe/index.js'
-//         config:
-//           cacheTtlHours: 168        # re-probe when the cache is older
-//           order: 30                 # systemPrompt section order
-//           language: 'en'            # section text language: 'en' | 'zh'
-//           cacheDir: '~/.dsh-env-probe'
-//           runtimes: ['git','node','python']   # override the default list
-//           tools: ['curl','ffmpeg']            # override the default list
-//           perProbeTimeoutMs: 5000
-//           totalTimeoutMs: 30000
-//           concurrency: 4
+//   - id: env-probe
+//     config:
+//       cacheTtlHours: 168        # re-probe when the cache is older
+//       order: 30                 # systemPrompt section order
+//       language: 'en'            # section text language: 'en' | 'zh'
+//       cacheDir: '~/.dsh-env-probe'
+//       runtimes: ['git','node','python']   # override the default list
+//       tools: ['curl','ffmpeg']            # override the default list
+//       shells: ['pwsh','cmd']              # override the probed shell list
+//       versionArgs:                        # merged over the built-in table
+//         '7z': ['-h']                      # [] runs the executable bare
+//         terraform: ['version']
+//       execAliases:                        # merged over the built-in table
+//         pnpm: ['pnpm.cmd', 'pnpm']
+//       perProbeTimeoutMs: 5000
+//       totalTimeoutMs: 30000
+//       concurrency: 4
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { arch, cpus, homedir, platform, release, totalmem, type as osType, version as osVersion } from 'node:os';
@@ -55,14 +68,28 @@ const IS_WIN = platform() === 'win32';
 const DEFAULT_RUNTIMES = ['git', 'node', 'npm', 'python', 'python3', 'pip', 'docker', 'java', 'go', 'rustc'];
 const DEFAULT_TOOLS = ['curl', 'wget', 'ffmpeg', '7z', 'pandoc', 'tar', 'unzip', 'make', 'gcc', 'pwsh'];
 
-// Version-flag overrides; everything else is probed with `--version`.
-const VERSION_ARGS = { java: ['-version'], go: ['version'], '7z': ['-h'], tar: ['--version'], unzip: ['-v'] };
+// Version-flag table; everything else is probed with `--version`. Config
+// `versionArgs` is merged over this, so a name here can be re-pointed without
+// touching this file, and an unknown name gets `--version` unless configured.
+const DEFAULT_VERSION_ARGS = {
+    java: ['-version'],
+    go: ['version'],
+    '7z': ['-h'],
+    tar: ['--version'],
+    unzip: ['-v'],
+};
+
 // Alias resolution: tool name -> candidate executable names.
-const EXEC_ALIASES = {
+const DEFAULT_EXEC_ALIASES = {
     '7z': ['7z', '7za', '7zr'],
     python: IS_WIN ? ['python', 'py'] : ['python'],
     npm: IS_WIN ? ['npm.cmd', 'npm'] : ['npm'],
+    pnpm: IS_WIN ? ['pnpm.cmd', 'pnpm'] : ['pnpm'],
 };
+
+const DEFAULT_SHELLS = IS_WIN
+    ? ['pwsh', 'powershell', 'cmd', 'bash']
+    : ['bash', 'zsh', 'sh', 'fish', 'pwsh'];
 
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,63}$/;
 
@@ -73,11 +100,38 @@ const DEFAULTS = {
     cacheDir: '~/.dsh-env-probe',
     runtimes: DEFAULT_RUNTIMES,
     tools: DEFAULT_TOOLS,
+    shells: DEFAULT_SHELLS,
+    versionArgs: DEFAULT_VERSION_ARGS,
+    execAliases: DEFAULT_EXEC_ALIASES,
     perProbeTimeoutMs: 5000,
     totalTimeoutMs: 30000,
     concurrency: 4,
     marker: 'ENV-PROBE',
 };
+
+export const TOOL_NAME = 'env_refresh';
+
+// The tool definition is a plain registry-ready object: `ctx.tools.register`
+// validates `output.render` and `output.schema` itself, so importing
+// `@deepseek-ai/dsh-tools` (not resolvable from a profile plugin) is not
+// required and this stays dependency-free.
+const TOOL_PARAMETERS = Object.freeze({
+    type: 'object',
+    additionalProperties: false,
+    properties: {},
+});
+
+const TOOL_OUTPUT_SCHEMA = Object.freeze({
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        ok: { type: 'boolean' },
+        probedAt: { type: 'string' },
+        summary: { type: 'string' },
+        error: { type: 'string' },
+    },
+    required: ['ok', 'probedAt', 'summary'],
+});
 
 export const Config = {
     '~standard': {
@@ -102,12 +156,25 @@ export const Config = {
             if (input.marker !== undefined && typeof input.marker !== 'string') {
                 issues.push({ message: 'marker must be a string', path: ['marker'] });
             }
-            for (const key of ['runtimes', 'tools']) {
-                if (input[key] !== undefined) {
-                    if (!Array.isArray(input[key]) || input[key].some(v => typeof v !== 'string' || !NAME_RE.test(v))) {
-                        issues.push({ message: `${key} must be an array of safe executable names`, path: [key] });
-                    }
+            const nameList = (key, value) => Array.isArray(value) && value.every(v => typeof v === 'string' && NAME_RE.test(v));
+            for (const key of ['runtimes', 'tools', 'shells']) {
+                if (input[key] !== undefined && !nameList(key, input[key])) {
+                    issues.push({ message: `${key} must be an array of safe executable names`, path: [key] });
                 }
+            }
+            // Executable-name -> argv tables: `versionArgs` values are argv
+            // fragments (any string is fine), `execAliases` values are names.
+            if (input.versionArgs !== undefined) {
+                const t = input.versionArgs;
+                const bad = typeof t !== 'object' || t === null || Array.isArray(t)
+                    || Object.entries(t).some(([k, v]) => !NAME_RE.test(k) || !Array.isArray(v) || v.some(a => typeof a !== 'string'));
+                if (bad) issues.push({ message: 'versionArgs must map safe executable names to string arrays', path: ['versionArgs'] });
+            }
+            if (input.execAliases !== undefined) {
+                const t = input.execAliases;
+                const bad = typeof t !== 'object' || t === null || Array.isArray(t)
+                    || Object.entries(t).some(([k, v]) => !NAME_RE.test(k) || !nameList('execAliases', v) || v.length === 0);
+                if (bad) issues.push({ message: 'execAliases must map safe executable names to non-empty name arrays', path: ['execAliases'] });
             }
             if (issues.length) return { issues };
             return { value: { ...DEFAULTS, ...input } };
@@ -156,21 +223,33 @@ function firstLine(s) {
     return (s || '').split(/\r?\n/).map(x => x.trim()).find(Boolean) || '';
 }
 
-async function probeExecutable(name, perTimeoutMs) {
-    const candidates = EXEC_ALIASES[name] || [name];
-    let pathFound = null, resolved = name;
-    for (const c of candidates) {
-        pathFound = await which(c, perTimeoutMs);
-        if (pathFound) { resolved = c; break; }
+// npm/pnpm install a POSIX launcher (no extension) next to the Windows shim;
+// `where pnpm` returns the launcher first and execFile cannot run it. Prefer a
+// sibling that Windows can actually execute.
+function pickRunnable(found) {
+    if (!IS_WIN || /\.[a-z0-9]+$/i.test(found)) return found;
+    for (const ext of ['.exe', '.cmd', '.bat']) {
+        if (existsSync(found + ext)) return found + ext;
     }
-    if (!pathFound) return { name, available: false };
-    const args = VERSION_ARGS[name] || ['--version'];
+    return found;
+}
+
+async function probeExecutable(name, perTimeoutMs, versionArgs, execAliases) {
+    const candidates = execAliases[name] || [name];
+    let found = null, resolved = name;
+    for (const c of candidates) {
+        found = await which(c, perTimeoutMs);
+        if (found) { resolved = c; break; }
+    }
+    if (!found) return { name, available: false };
+    const execPath = pickRunnable(found);
+    const args = versionArgs[name] ?? ['--version'];
     // .cmd/.bat shims need cmd.exe as interpreter on modern Node.
-    const viaCmd = IS_WIN && /\.(cmd|bat)$/i.test(resolved);
-    const v = viaCmd ? await run('cmd', ['/c', resolved, ...args], perTimeoutMs)
-                     : await run(resolved, args, perTimeoutMs);
+    const viaCmd = IS_WIN && /\.(cmd|bat)$/i.test(execPath);
+    const v = viaCmd ? await run('cmd', ['/c', execPath, ...args], perTimeoutMs)
+                     : await run(execPath, args, perTimeoutMs);
     const ver = firstLine(v.out).slice(0, 120);
-    return { name, available: true, path: pathFound, version: ver || undefined };
+    return { name, available: true, path: execPath, version: ver || undefined };
 }
 
 async function probeOs(perTimeoutMs) {
@@ -200,8 +279,7 @@ async function probeOs(perTimeoutMs) {
     return info;
 }
 
-async function probeShells(perTimeoutMs) {
-    const shells = IS_WIN ? ['pwsh', 'powershell', 'cmd', 'bash'] : ['bash', 'zsh', 'sh', 'fish', 'pwsh'];
+async function probeShells(perTimeoutMs, shells) {
     const found = [];
     for (const s of shells) {
         const p = await which(s, perTimeoutMs);
@@ -259,22 +337,26 @@ async function pool(items, size, worker) {
 // Full probe. Returns a structured report object; never throws.
 export async function probeEnvironment(cfg) {
     const per = cfg.perProbeTimeoutMs, conc = cfg.concurrency;
+    const versionArgs = { ...DEFAULT_VERSION_ARGS, ...(cfg.versionArgs ?? {}) };
+    const execAliases = { ...DEFAULT_EXEC_ALIASES, ...(cfg.execAliases ?? {}) };
+    const shells = cfg.shells ?? DEFAULT_SHELLS;
     const deadline = Date.now() + cfg.totalTimeoutMs;
     const withBudget = async (label, fn, fallback) => {
         if (Date.now() > deadline) return fallback;
         try { return await fn(); } catch { return fallback; }
     };
-    const [osInfo, shells, runtimes, tools, disks] = await Promise.all([
+    const probe = (n) => probeExecutable(n, per, versionArgs, execAliases);
+    const [osInfo, shellInfo, runtimes, tools, disks] = await Promise.all([
         withBudget('os', () => probeOs(per), {}),
-        withBudget('shells', () => probeShells(per), { current: 'unknown', available: [] }),
-        withBudget('runtimes', () => pool(cfg.runtimes, conc, n => probeExecutable(n, per)), []),
-        withBudget('tools', () => pool(cfg.tools, conc, n => probeExecutable(n, per)), []),
+        withBudget('shells', () => probeShells(per, shells), { current: 'unknown', available: [] }),
+        withBudget('runtimes', () => pool(cfg.runtimes, conc, probe), []),
+        withBudget('tools', () => pool(cfg.tools, conc, probe), []),
         withBudget('disks', () => probeDisks(per), []),
     ]);
     return {
         probedAt: new Date().toISOString(),
         os: osInfo,
-        shells,
+        shells: shellInfo,
         runtimes,
         tools,
         disks,
@@ -288,44 +370,68 @@ export async function probeEnvironment(cfg) {
 
 const L = {
     en: {
-        title: 'LOCAL MACHINE ENVIRONMENT PROFILE',
-        intro: 'The following is an automatically probed profile of the machine this agent runs on. Trust it over assumptions: use the listed runtimes/tools and their paths directly, and do NOT attempt commands whose executables are listed as unavailable. Prefer probing alternatives before installing anything.',
+        title: 'LOCAL MACHINE ENVIRONMENT SNAPSHOT',
+        intro: 'This snapshot describes the machine only as it was at the time above. Runtimes and tools installed, upgraded, removed or moved on PATH afterwards are not reflected here, so it may already be out of date.',
+        refreshHint: 'When a listed path or version disagrees with what the machine actually does, trust the real command and call the `env_refresh` tool to probe again.',
+        refreshHintNoTool: 'When a listed path or version disagrees with what the machine actually does, trust the real command and re-probe before relying on this snapshot.',
+        unavailableNote: 'An entry marked unavailable only means the executable was not found on PATH when the probe ran.',
         os: 'Operating System', shells: 'Shells', runtimes: 'Runtimes', tools: 'Tools',
         disks: 'Disks', proxy: 'Proxy Environment', none: 'none detected',
         current: 'current', probedAt: 'probed at', unavailable: 'unavailable',
-        stale: '(re-probe in progress; values may be stale)',
-        cmdRefreshDesc: 're-probe the local environment and update the injected profile',
-        cmdSuggestDesc: 'refresh the profile, then ask the agent for environment optimization suggestions',
-        cmdRefreshed: 'Environment profile refreshed',
+        ageNow: 'just now', ageMinutes: '{n} min ago', ageHours: '{n} h ago', ageDays: '{n} d ago',
+        stale: '(cache expired: re-probing in the background, values below are from the older probe)',
+        noReport: 'The environment probe has not finished yet or failed. Assume a generic environment and verify before relying on it.',
+        cmdRefreshDesc: 're-probe the local environment, rewrite the cache, and return only what changed since the previous probe',
+        cmdHint: 'no arguments; press Enter',
+        cmdRefreshed: 'Environment snapshot refreshed',
         cmdProbeFailed: 'environment probe failed',
-        changes: 'changes since last probe',
-        noChanges: 'no changes since last probe',
-        cmdSuggestQueued: 'Profile refreshed. Asking the agent for optimization suggestions based on the latest profile…',
-        cmdSuggestNoAgent: '(No agent attached to this command; ask the agent directly for optimization suggestions.)',
-        suggestPrompt: 'Based on the LOCAL MACHINE ENVIRONMENT PROFILE (ENV-PROBE) freshly injected into your system prompt, give optimization suggestions for this computer: 1) list missing but commonly useful runtimes/tools (the items marked unavailable), with their purpose and the recommended install method for this OS; 2) flag outdated versions worth upgrading; 3) output a priority-sorted table, conclusion first. Do NOT install anything — propose first and wait for my confirmation.',
+        noChanges: 'no changes since the previous probe',
+        toolDesc: 'Re-probe this machine\'s environment now (OS, shells, runtimes, tools, disks, proxy), rewrite the cached snapshot that is injected into the system prompt, and return ONLY the diff against the previous probe. Blocks until the probe finishes when one is already running. Call it after installing, upgrading or removing a tool, or when a path or version from the injected ENV-PROBE snapshot no longer matches reality. Read-only: it never installs anything.',
+        toolNoArgs: 'Takes no arguments.',
     },
     zh: {
-        title: '本机环境档案',
-        intro: '以下是自动探测生成的本机环境档案。请信任它而不是猜测：直接使用列出的运行时/工具及其路径，不要尝试调用标记为不可用的程序。如需安装新软件，先向用户确认。',
+        title: '本机环境快照',
+        intro: '这份快照只描述探测时刻的状态。探测之后安装、升级、删除或改动 PATH 的运行时与工具都不会反映在这里，所以它可能已经过时。',
+        refreshHint: '清单里的路径或版本与机器实际情况不符时，以真实命令的输出为准，并调用 `env_refresh` 工具重新探测。',
+        refreshHintNoTool: '清单里的路径或版本与机器实际情况不符时，以真实命令的输出为准，并在依赖它之前重新探测。',
+        unavailableNote: '标记为未探测到的项，只表示探测时 PATH 上找不到它。',
         os: '操作系统', shells: 'Shell', runtimes: '运行时', tools: '工具',
         disks: '磁盘', proxy: '代理环境变量', none: '未检测到',
-        current: '当前', probedAt: '探测时间', unavailable: '不可用',
-        stale: '（正在重新探测，以下值可能过期）',
-        cmdRefreshDesc: '重新探测本机环境并更新注入的环境档案',
-        cmdSuggestDesc: '刷新环境档案后，让助手基于最新档案给出环境优化建议',
-        cmdRefreshed: '环境档案已刷新',
+        current: '当前', probedAt: '探测于', unavailable: '未探测到',
+        ageNow: '刚刚', ageMinutes: '{n} 分钟前', ageHours: '{n} 小时前', ageDays: '{n} 天前',
+        stale: '（缓存已过期，正在后台重探，以下为更早一次的探测结果）',
+        noReport: '环境探测尚未完成或已失败。先按通用环境处理，并在依赖这些信息前核实。',
+        cmdRefreshDesc: '重新探测本机环境、重写缓存，只返回与上次探测的差异',
+        cmdHint: '无需参数，直接回车',
+        cmdRefreshed: '环境快照已刷新',
         cmdProbeFailed: '环境探测失败',
-        changes: '较上次探测的变化',
         noChanges: '较上次探测无变化',
-        cmdSuggestQueued: '档案已刷新，正在让助手基于最新档案给出优化建议……',
-        cmdSuggestNoAgent: '（该命令未绑定会话，请直接向助手索要优化建议。）',
-        suggestPrompt: '请基于系统提示词中最新注入的本机环境档案（ENV-PROBE），给出这台电脑的环境优化建议：1) 指出缺失但对开发/日常使用常见且重要的运行时与工具（档案中标记为不可用的项），说明各自用途并给出适合当前系统的推荐安装方式；2) 指出版本过旧、值得升级的项；3) 按优先级排序输出表格，先结论后细节。不要执行任何安装操作，先给建议并等待我确认。',
+        toolDesc: '立即重新探测本机环境（系统、shell、运行时、工具、磁盘、代理），重写注入到系统提示词里的环境快照缓存，只返回与上次探测的差异。已有探测在进行时会阻塞等待其完成。安装、升级、卸载工具后，或注入的 ENV-PROBE 快照中的路径/版本与实际不符时调用。只读操作，不会安装任何东西。',
+        toolNoArgs: '无参数。',
     },
 };
 
-function renderMarkdown(report, cfg, stale) {
+function ageText(iso, t) {
+    const ms = Date.now() - Date.parse(iso);
+    if (!Number.isFinite(ms) || ms < 0) return '';
+    const min = Math.round(ms / 60000);
+    if (min < 2) return t.ageNow;
+    if (min < 90) return t.ageMinutes.replace('{n}', String(min));
+    const hours = Math.round(min / 60);
+    if (hours < 48) return t.ageHours.replace('{n}', String(hours));
+    return t.ageDays.replace('{n}', String(Math.round(hours / 24)));
+}
+
+function renderMarkdown(report, cfg, stale, toolAvailable) {
     const t = L[cfg.language] || L.en;
-    const lines = [`${cfg.marker}: ${t.title} (${t.probedAt}: ${report.probedAt})${stale ? ' ' + t.stale : ''}`, t.intro, ''];
+    const age = ageText(report.probedAt, t);
+    const lines = [
+        `${cfg.marker}: ${t.title} (${t.probedAt} ${report.probedAt}${age ? `, ${age}` : ''})${stale ? ' ' + t.stale : ''}`,
+        t.intro,
+        toolAvailable ? t.refreshHint : t.refreshHintNoTool,
+        t.unavailableNote,
+        '',
+    ];
     const o = report.os || {};
     lines.push(`## ${t.os}`);
     lines.push(`- ${o.pretty || `${o.type || '?'} ${o.release || ''}`} | ${o.arch || '?'} | CPU: ${o.cpus ?? '?'} | RAM: ${o.totalMemGB ?? '?'} GB`);
@@ -351,36 +457,83 @@ function renderMarkdown(report, cfg, stale) {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin entry
+// Diffing (the only thing the command and the tool hand back)
 // ---------------------------------------------------------------------------
 
-// Compare two cached reports on runtimes/tools availability & versions.
+/**
+ * Compare two cached reports on runtimes/tools availability & versions.
+ * Returns an empty diff when there is no previous report to compare against.
+ * A changed entry keeps the kind so the reply can say which side moved:
+ * a version bump and a relocated executable are different facts.
+ * @returns {{ added: object[], removed: string[], changed: { name: string, kind: 'version'|'path', from: string, to: string }[] }}
+ */
 function diffReports(oldReport, newReport) {
-    const changes = [];
-    if (!oldReport) return null;
+    const diff = { added: [], removed: [], changed: [] };
+    if (!oldReport) return diff;
     for (const key of ['runtimes', 'tools']) {
         const oldMap = new Map((oldReport[key] || []).map(i => [i.name, i]));
         for (const item of newReport[key] || []) {
             const prev = oldMap.get(item.name);
-            if (prev && !prev.available && item.available) changes.push(`+${item.name}`);
-            else if (prev && prev.available && !item.available) changes.push(`-${item.name}`);
-            else if (prev && prev.available && item.available && (prev.version || '') !== (item.version || '')) changes.push(`~${item.name}`);
+            if (!prev || !prev.available) {
+                if (item.available) diff.added.push(item);
+                continue;
+            }
+            if (!item.available) { diff.removed.push(item.name); continue; }
+            if ((prev.version || '') !== (item.version || '')) {
+                diff.changed.push({ name: item.name, kind: 'version', from: prev.version || '?', to: item.version || '(no version output)' });
+            } else if ((prev.path || '') !== (item.path || '')) {
+                diff.changed.push({ name: item.name, kind: 'path', from: prev.path || '?', to: item.path || '?' });
+            }
         }
-        const newMap = new Set((newReport[key] || []).map(i => i.name));
-        for (const [nm, prev] of oldMap) {
-            if (!newMap.has(nm) && prev.available) changes.push(`-${nm}`);
-        }
+        const present = new Set((newReport[key] || []).map(i => i.name));
+        for (const [nm, prev] of oldMap) if (!present.has(nm) && prev.available) diff.removed.push(nm);
     }
-    return changes;
+    return diff;
 }
+
+function isEmptyDiff(diff) {
+    return !diff || (!diff.added.length && !diff.removed.length && !diff.changed.length);
+}
+
+/** One-line-per-change diff text. Never the full report. */
+function renderDiff(diff) {
+    const lines = [];
+    for (const item of diff.added) {
+        lines.push(`+ ${item.name}: ${item.version || 'ok'} (${item.path})`);
+    }
+    for (const name of diff.removed) lines.push(`- ${name}`);
+    for (const c of diff.changed) {
+        lines.push(c.kind === 'path'
+            ? `~ ${c.name} (path): ${c.from} -> ${c.to}`
+            : `~ ${c.name}: ${c.from} -> ${c.to}`);
+    }
+    return lines.join('\n');
+}
+
+function refreshReply(result, t) {
+    if (!result.ok) return `${t.cmdProbeFailed}: ${result.error}`;
+    const head = `${t.cmdRefreshed} (${t.probedAt} ${result.report.probedAt})`;
+    if (isEmptyDiff(result.diff)) return `${head}: ${t.noChanges}`;
+    return `${head}\n${renderDiff(result.diff)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Plugin entry
+// ---------------------------------------------------------------------------
 
 export function apply(ctx, config) {
     const cfg = { ...DEFAULTS, ...(config ?? {}) };
+    const t = L[cfg.language] || L.en;
     const dir = resolve(expandHome(cfg.cacheDir));
     const jsonPath = join(dir, 'env-profile.json');
+    const mdPath = join(dir, 'env-profile.md');
 
     // Live state served by the section provider (evaluated at each assembly).
-    const state = { report: null, stale: false, inflight: null, lastError: null };
+    const state = { report: null, stale: false, inflight: null, lastError: null, toolAvailable: false };
+
+    const warn = (message) => {
+        try { ctx.logger?.warn?.(message); } catch { /* logging is best-effort */ }
+    };
 
     function readCache() {
         try {
@@ -391,31 +544,35 @@ export function apply(ctx, config) {
         } catch { return null; }
     }
 
-    // Single-flight re-probe: concurrent callers (boot, TTL check, /env-refresh,
-    // /env-suggest) share one in-flight run; resolves to the fresh report.
+    function readCachedReport() {
+        try { return JSON.parse(readFileSync(jsonPath, 'utf-8')); } catch { return null; }
+    }
+
+    // Single-flight, blocking re-probe. Callers (boot, TTL check, /env-refresh,
+    // the env_refresh tool) all join the same in-flight run and are resolved
+    // only by a probe that actually completed - never by the stale cache.
     function reprobe() {
         if (state.inflight) return state.inflight;
-        state.inflight = (async () => {
-            let oldReport = null;
-            try { oldReport = JSON.parse(readFileSync(jsonPath, 'utf-8')); } catch { /* first run */ }
-            let report;
+        const job = (async () => {
+            const oldReport = readCachedReport();
             try {
-                report = await probeEnvironment(cfg);
+                const report = await probeEnvironment(cfg);
                 mkdirSync(dir, { recursive: true });
                 writeFileSync(jsonPath, JSON.stringify(report, null, 2));
-                writeFileSync(join(dir, 'env-profile.md'), renderMarkdown(report, cfg, false));
+                writeFileSync(mdPath, renderMarkdown(report, cfg, false, state.toolAvailable));
                 state.report = report;
                 state.stale = false;
                 state.lastError = null;
-                report.changes = diffReports(oldReport, report);
+                return { ok: true, report, diff: diffReports(oldReport, report) };
             } catch (e) {
-                state.lastError = e && e.message;
+                state.lastError = (e && e.message) || String(e);
+                return { ok: false, error: state.lastError };
+            } finally {
+                state.inflight = null;
             }
-            return state.report;
         })();
-        const done = state.inflight.finally(() => { state.inflight = null; });
-        state.inflight = done;
-        return done;
+        state.inflight = job;
+        return job;
     }
 
     // Boot: serve a fresh cache immediately; otherwise probe in background.
@@ -442,76 +599,67 @@ export function apply(ctx, config) {
                 } catch { /* no cache file yet: boot probe already running */ }
             }
             if (!state.report) {
-                return `${cfg.marker}: environment probe in progress or failed${state.lastError ? ` (${state.lastError})` : ''}. Assume a generic ${IS_WIN ? 'Windows' : 'POSIX'} environment and verify before use.`;
+                return `${cfg.marker}: ${t.noReport}${state.lastError ? ` (${state.lastError})` : ''}`;
             }
-            return renderMarkdown(state.report, cfg, state.stale);
+            return renderMarkdown(state.report, cfg, state.stale, state.toolAvailable);
         },
     });
 
     // -----------------------------------------------------------------------
-    // Optional slash commands (v1.0.1): registered only when the `commands`
-    // service is composed (Web UI). Headless profiles simply skip this — the
-    // section injection above keeps working unchanged.
+    // Optional /env-refresh command (registered only when the `commands`
+    // service is composed, e.g. the Web UI).
     // -----------------------------------------------------------------------
     if (typeof ctx.inject === 'function') {
         ctx.inject(['commands'], (commandCtx) => {
-            const t = L[cfg.language] || L.en;
-            const summarize = (report) => {
-                if (!report) return t.cmdProbeFailed + (state.lastError ? ` (${state.lastError})` : '');
-                const rt = (report.runtimes || []).filter(i => i.available).length;
-                const rtAll = (report.runtimes || []).length;
-                const tl = (report.tools || []).filter(i => i.available).length;
-                const tlAll = (report.tools || []).length;
-                const lines = [
-                    `${t.cmdRefreshed}: ${report.probedAt}`,
-                    `${report.os?.pretty || report.os?.type || '?'} | ${report.os?.arch || '?'} | CPU: ${report.os?.cpus ?? '?'} | RAM: ${report.os?.totalMemGB ?? '?'} GB`,
-                    `${t.runtimes}: ${rt}/${rtAll} | ${t.tools}: ${tl}/${tlAll}`,
-                ];
-                if (report.changes && report.changes.length) lines.push(`${t.changes}: ${report.changes.join(', ')}`);
-                else if (report.changes) lines.push(t.noChanges);
-                return lines.join('\n');
-            };
-
             commandCtx.commands.register({
                 name: 'env-refresh',
                 description: t.cmdRefreshDesc,
-                input: { hint: '' },
+                input: { hint: t.cmdHint },
                 recordInput: false,
                 handler: async () => {
-                    const report = await reprobe();
-                    return report
-                        ? { kind: 'success', text: summarize(report) }
-                        : { kind: 'error', text: t.cmdProbeFailed + (state.lastError ? ` (${state.lastError})` : '') };
+                    const result = await reprobe();
+                    if (!result.ok) return { kind: 'error', text: `${t.cmdProbeFailed}: ${result.error}` };
+                    return { kind: 'success', text: refreshReply(result, t) };
                 },
             });
+        });
+    }
 
-            commandCtx.commands.register({
-                name: 'env-suggest',
-                description: t.cmdSuggestDesc,
-                input: { hint: '' },
-                recordInput: false,
-                handler: async ({ agent }) => {
-                    const report = await reprobe();
-                    if (!report) return { kind: 'error', text: t.cmdProbeFailed + (state.lastError ? ` (${state.lastError})` : '') };
-                    if (agent && typeof agent.steer === 'function') {
-                        try {
-                            // Same pattern as the official /plan command: submit a
-                            // user message; the reply streams as a normal assistant
-                            // answer with the freshly re-assembled prompt.
-                            agent.steer({
-                                id: crypto.randomUUID(),
-                                role: 'user',
-                                content: [{ type: 'text', text: t.suggestPrompt }],
-                                source: { kind: 'user' },
-                            });
-                            return { kind: 'success', text: t.cmdSuggestQueued };
-                        } catch (e) {
-                            return { kind: 'error', text: `steer failed: ${e && e.message}` };
-                        }
-                    }
-                    return { kind: 'success', text: summarize(report) + '\n' + t.cmdSuggestNoAgent };
+    // -----------------------------------------------------------------------
+    // env_refresh tool for the model: same blocking refresh, diff-only answer.
+    // Registered as a plain registry-ready definition because
+    // `ctx.tools.register` validates the shape itself.
+    // -----------------------------------------------------------------------
+    if (typeof ctx.inject === 'function') {
+        ctx.inject(['tools'], (toolCtx) => {
+            const tool = {
+                name: TOOL_NAME,
+                description: `${t.toolDesc}\n${t.toolNoArgs}`,
+                parameters: TOOL_PARAMETERS,
+                output: {
+                    schema: TOOL_OUTPUT_SCHEMA,
+                    render: (_args, value) => [{ type: 'text', text: value.summary }],
                 },
-            });
+                timeoutMs: cfg.totalTimeoutMs + 5000,
+                async execute() {
+                    const result = await reprobe();
+                    if (!result.ok) {
+                        return { ok: false, probedAt: '', summary: `${t.cmdProbeFailed}: ${result.error}`, error: result.error };
+                    }
+                    return {
+                        ok: true,
+                        probedAt: result.report.probedAt,
+                        summary: refreshReply(result, t),
+                    };
+                },
+            };
+            try {
+                toolCtx.tools.register(tool);
+                state.toolAvailable = true;
+            } catch (e) {
+                state.toolAvailable = false;
+                warn(`env_refresh tool not registered: ${(e && e.message) || e}`);
+            }
         });
     }
 }
