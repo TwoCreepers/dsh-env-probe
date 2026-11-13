@@ -24,8 +24,14 @@
 //     to their runnable .cmd sibling so the version probe actually runs.
 //   - the diff tells a version bump (`~ name: old -> new`) apart from an
 //     executable that moved on PATH (`~ name (path): old -> new`).
-//   - v1.2.0: `cacheTtlHours` defaults to 1 and the expired-cache notice is
-//     gone - the header always states the probe time and its age instead.
+//   - v1.2.0: the expired-cache notice is gone; the header always states the
+//     probe time instead.
+//   - v1.3.0: `cacheTtlHours` defaults back to 24; `injectSection: false`
+//     makes this a tool-only plugin that never touches the system prompt;
+//     the injected header carries only the absolute probe time (no relative
+//     age), so a warm cache keeps the prompt byte-identical across turns and
+//     the provider-side prompt cache keeps hitting; env_probe refreshes by
+//     itself once the cache is older than the TTL.
 //
 // Generic by design: no machine-specific endpoints, no local-service checks,
 // every probe item is configurable. Read-only commands only.
@@ -48,6 +54,7 @@
 //   - id: env-probe
 //     config:
 //       cacheTtlHours: 168        # re-probe when the cache is older
+//       injectSection: true       # false = tools only, nothing injected
 //       order: 30                 # systemPrompt section order
 //       language: 'en'            # section text language: 'en' | 'zh'
 //       cacheDir: '~/.dsh-env-probe'
@@ -68,7 +75,11 @@ import { arch, cpus, homedir, platform, release, totalmem, type as osType, versi
 import { join, resolve } from 'node:path';
 
 export const name = 'dsh-env-probe';
-export const inject = ['systemPrompt'];
+// Nothing is required up front: the prompt section, the command and both tools
+// are each attached through ctx.inject, so a composition missing any one of
+// those services still gets the rest (and `injectSection: false` turns the
+// plugin into a tool-only plugin that never touches the system prompt).
+export const inject = [];
 
 const IS_WIN = platform() === 'win32';
 
@@ -101,10 +112,14 @@ const DEFAULT_SHELLS = IS_WIN
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,63}$/;
 
 const DEFAULTS = {
-    cacheTtlHours: 1,
+    cacheTtlHours: 24,
     order: 30,
     language: 'en',
     cacheDir: '~/.dsh-env-probe',
+    // Register the system-prompt section at all. `false` turns this into a
+    // tool-only plugin: nothing is injected, so every turn's prompt stays
+    // byte-identical and the provider-side prompt cache keeps hitting.
+    injectSection: true,
     runtimes: DEFAULT_RUNTIMES,
     tools: DEFAULT_TOOLS,
     shells: DEFAULT_SHELLS,
@@ -240,6 +255,9 @@ export const Config = {
             }
             if (input.marker !== undefined && typeof input.marker !== 'string') {
                 issues.push({ message: 'marker must be a string', path: ['marker'] });
+            }
+            if (input.injectSection !== undefined && typeof input.injectSection !== 'boolean') {
+                issues.push({ message: 'injectSection must be a boolean', path: ['injectSection'] });
             }
             const nameList = (key, value) => Array.isArray(value) && value.every(v => typeof v === 'string' && NAME_RE.test(v));
             for (const key of ['runtimes', 'tools', 'shells']) {
@@ -463,16 +481,15 @@ const L = {
         os: 'Operating System', shells: 'Shells', runtimes: 'Runtimes', tools: 'Tools',
         disks: 'Disks', proxy: 'Proxy Environment', none: 'none detected',
         current: 'current', probedAt: 'probed at', unavailable: 'unavailable',
-        ageNow: 'just now', ageMinutes: '{n} min ago', ageHours: '{n} h ago', ageDays: '{n} d ago',
         noReport: 'The environment probe has not finished yet or failed. Assume a generic environment and verify before relying on it.',
         cmdRefreshDesc: 're-probe the local environment, rewrite the cache, and return only what changed since the previous probe',
         cmdHint: 'no arguments; press Enter',
         cmdRefreshed: 'Environment snapshot refreshed',
         cmdProbeFailed: 'environment probe failed',
         noChanges: 'no changes since the previous probe',
-        toolDesc: 'Re-probe this machine\'s environment now (OS, shells, runtimes, tools, disks, proxy), rewrite the cached snapshot that is injected into the system prompt, and return ONLY the diff against the previous probe as structured data (added / removed / changed). Blocks until an already-running probe finishes. Call it after installing, upgrading or removing a tool, or when a path or version from the injected ENV-PROBE snapshot no longer matches reality. Read-only: it never installs anything.',
+        toolDesc: 'Re-probe this machine\'s environment now (OS, shells, runtimes, tools, disks, proxy), rewrite the cached snapshot, and return ONLY the diff against the previous probe as structured data (added / removed / changed). Blocks until an already-running probe finishes. Call it after installing, upgrading or removing a tool, or when a path or version from the injected ENV-PROBE snapshot no longer matches reality. Read-only: it never installs anything.',
         toolNoArgs: 'Takes no arguments.',
-        probeDesc: 'Read the current machine environment snapshot as structured data: OS, shell, disks, proxy, and one entry per configured runtime and tool with name, kind, available, path and version. No probe is spawned - it answers from the cached snapshot, waiting for a background probe that is already running. Use it to resolve an executable path (e.g. the python or node entry) before calling another tool, instead of guessing PATH or shelling out to `where`/`which`. Call env_refresh instead when you need fresh facts.',
+        probeDesc: 'Read the current machine environment snapshot as structured data: OS, shell, disks, proxy, and one entry per configured runtime and tool with name, kind, available, path and version. Answer comes from the cached snapshot when it is still within cacheTtlHours; otherwise (or when no snapshot exists) it probes once. If a probe is already running it waits for that run instead of racing it. Use it to resolve an executable path (e.g. the python or node entry) before calling another tool, instead of guessing PATH or shelling out to `where`/`which`. Call env_refresh when you specifically need the diff.',
         probeUnavailable: 'no environment snapshot available yet',
     },
     zh: {
@@ -484,36 +501,26 @@ const L = {
         os: '操作系统', shells: 'Shell', runtimes: '运行时', tools: '工具',
         disks: '磁盘', proxy: '代理环境变量', none: '未检测到',
         current: '当前', probedAt: '探测于', unavailable: '未探测到',
-        ageNow: '刚刚', ageMinutes: '{n} 分钟前', ageHours: '{n} 小时前', ageDays: '{n} 天前',
         noReport: '环境探测尚未完成或已失败。先按通用环境处理，并在依赖这些信息前核实。',
         cmdRefreshDesc: '重新探测本机环境、重写缓存，只返回与上次探测的差异',
         cmdHint: '无需参数，直接回车',
         cmdRefreshed: '环境快照已刷新',
         cmdProbeFailed: '环境探测失败',
         noChanges: '较上次探测无变化',
-        toolDesc: '立即重新探测本机环境（系统、shell、运行时、工具、磁盘、代理），重写注入到系统提示词里的环境快照缓存，只返回与上次探测的差异（结构化 added / removed / changed）。已有探测在进行时会阻塞等待其完成。安装、升级、卸载工具后，或注入的 ENV-PROBE 快照中的路径/版本与实际不符时调用。只读操作，不会安装任何东西。',
+        toolDesc: '立即重新探测本机环境（系统、shell、运行时、工具、磁盘、代理），重写环境快照缓存，只返回与上次探测的差异（结构化 added / removed / changed）。已有探测在进行时会阻塞等待其完成。安装、升级、卸载工具后，或注入的 ENV-PROBE 快照中的路径/版本与实际不符时调用。只读操作，不会安装任何东西。',
         toolNoArgs: '无参数。',
-        probeDesc: '以结构化数据读取当前的本机环境快照：系统、shell、磁盘、代理，以及每个已配置运行时与工具的名称、kind、available、path、version。不会触发探测——直接读缓存，若后台正在探测则等待其完成。需要可执行文件路径时（例如 python、node 的条目）用它，不要靠猜 PATH 或另跑 where/which。需要最新事实时改用 env_refresh。',
+        probeDesc: '以结构化数据读取当前的本机环境快照：系统、shell、磁盘、代理，以及每个已配置运行时与工具的名称、kind、available、path、version。缓存在 cacheTtlHours 内就直接返回；过期或不存在时探测一次；若已有探测在跑则等那一次完成而不是抢跑。需要可执行文件路径时（例如 python、node 的条目）用它，不要靠猜 PATH 或另跑 where/which。只想知道差异时用 env_refresh。',
         probeUnavailable: '当前还没有可用的环境快照',
     },
 };
 
-function ageText(iso, t) {
-    const ms = Date.now() - Date.parse(iso);
-    if (!Number.isFinite(ms) || ms < 0) return '';
-    const min = Math.round(ms / 60000);
-    if (min < 2) return t.ageNow;
-    if (min < 90) return t.ageMinutes.replace('{n}', String(min));
-    const hours = Math.round(min / 60);
-    if (hours < 48) return t.ageHours.replace('{n}', String(hours));
-    return t.ageDays.replace('{n}', String(Math.round(hours / 24)));
-}
-
 function renderMarkdown(report, cfg, toolAvailable) {
     const t = L[cfg.language] || L.en;
-    const age = ageText(report.probedAt, t);
+    // No relative age here on purpose: a "16 min ago" suffix would change the
+    // system prompt every minute and bust the provider-side prompt cache. The
+    // absolute probe timestamp only changes when the snapshot is rewritten.
     const lines = [
-        `${cfg.marker}: ${t.title} (${t.probedAt} ${report.probedAt}${age ? `, ${age}` : ''})`,
+        `${cfg.marker}: ${t.title} (${t.probedAt} ${report.probedAt})`,
         t.intro,
         toolAvailable ? t.refreshHint : t.refreshHintNoTool,
         t.unavailableNote,
@@ -712,32 +719,35 @@ export function apply(ctx, config) {
         return job;
     }
 
-    // Boot: serve the cache immediately (however old); a cache past its TTL
-    // only triggers a silent background re-probe. There is no "expired" state
-    // to render: the header always states when the snapshot was taken.
+    // Boot: warm the cache so both the section and env_probe have something to
+    // serve. A cache past its TTL only triggers a silent background re-probe;
+    // there is no "expired" state to render, the header always states when the
+    // snapshot was taken. Nothing here depends on the section being enabled.
     const cached = readCache();
     if (cached) state.report = cached.report;
-    if (!cached || !cached.fresh) {
-        reprobe(); // fire and forget; the section provider picks it up on later assemblies
-    }
+    if (!cached || !cached.fresh) reprobe(); // fire and forget
 
-    ctx.systemPrompt.section({
-        name: 'env-probe',
-        order: cfg.order,
-        text: () => {
-            // TTL expiry check at assembly time: trigger background refresh.
-            if (!state.inflight) {
-                try {
-                    const mtime = statSync(jsonPath).mtimeMs;
-                    if (Date.now() - mtime > cfg.cacheTtlHours * 3600_000) reprobe();
-                } catch { /* no cache file yet: boot probe already running */ }
-            }
-            if (!state.report) {
-                return `${cfg.marker}: ${t.noReport}${state.lastError ? ` (${state.lastError})` : ''}`;
-            }
-            return renderMarkdown(state.report, cfg, state.toolAvailable);
-        },
-    });
+    if (cfg.injectSection) {
+        ctx.inject(['systemPrompt'], (promptCtx) => {
+            promptCtx.systemPrompt.section({
+                name: 'env-probe',
+                order: cfg.order,
+                text: () => {
+                    // TTL expiry check at assembly time: trigger background refresh.
+                    if (!state.inflight) {
+                        try {
+                            const mtime = statSync(jsonPath).mtimeMs;
+                            if (Date.now() - mtime > cfg.cacheTtlHours * 3600_000) reprobe();
+                        } catch { /* no cache file yet: the boot probe is running */ }
+                    }
+                    if (!state.report) {
+                        return `${cfg.marker}: ${t.noReport}${state.lastError ? ` (${state.lastError})` : ''}`;
+                    }
+                    return renderMarkdown(state.report, cfg, state.toolAvailable);
+                },
+            });
+        });
+    }
 
     // -----------------------------------------------------------------------
     // Optional /env-refresh command (registered only when the `commands`
@@ -805,19 +815,24 @@ export function apply(ctx, config) {
                 },
                 timeoutMs: cfg.totalTimeoutMs + 5000,
                 async execute() {
-                    let report = state.report;
                     // Never answer from the cache while a fresh probe is landing:
                     // wait for the in-flight run instead of racing it.
                     if (state.inflight) {
                         const inFlight = await state.inflight;
-                        if (inFlight.ok) report = inFlight.report;
+                        if (inFlight.ok) return snapshotValue(inFlight.report);
                     }
-                    if (!report) {
-                        const result = await reprobe();
-                        if (!result.ok) return probeFailure(result.error);
-                        report = result.report;
+                    // The answer is bounded by cacheTtlHours: a warm cache is
+                    // served as-is, a cold or missing one is probed once. This
+                    // keeps env_probe useful even when the injected section is
+                    // disabled and nothing else refreshes the cache.
+                    const warm = readCache();
+                    if (warm && warm.fresh) {
+                        state.report = warm.report;
+                        return snapshotValue(warm.report);
                     }
-                    return snapshotValue(report);
+                    const result = await reprobe();
+                    if (!result.ok) return probeFailure(result.error);
+                    return snapshotValue(result.report);
                 },
             };
 

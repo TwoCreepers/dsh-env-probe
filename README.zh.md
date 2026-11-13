@@ -2,14 +2,23 @@
 
 [English](README.md) | 中文
 
-零依赖 DeepSeek Harness 插件：启动时探测一次本机环境（操作系统 / Shell / 运行时 / 常用工具 / 磁盘 / 代理），把结果缓存到磁盘，并作为有序段注入每个会话的系统提示词。
+零依赖 DeepSeek Harness 插件：探测一次本机环境（操作系统 / Shell / 运行时 / 常用工具 / 磁盘 / 代理），缓存到磁盘，既可注入系统提示词，也把同一份事实以工具形式交给模型。
 
-> **本仓库是本地分支（v1.2.x）**，基于 [nodata404/dsh-env-probe](https://github.com/nodata404/dsh-env-probe) v1.0.1，改动见下方「相对 1.0.1 的改动」。
+> **本仓库是本地分支（v1.3.x）**，基于 [nodata404/dsh-env-probe](https://github.com/nodata404/dsh-env-probe) v1.0.1，改动见下方「相对 1.0.1 的改动」。
 
-## 注入效果（示例）
+## 两种模式
+
+| `injectSection` | 行为 | 提示词开销 |
+|---|---|---|
+| `true`（默认） | 快照作为系统提示词的一段注入 | 一段固定内容，整个 TTL 内不变 |
+| `false` | **纯工具模式**：完全不注入 | 零 |
+
+注入内容在两次探测之间是**冻结**的：标题只写绝对探测时间，不写"16 分钟前"这种相对年龄。相对年龄每分钟都在变，会让系统提示词每轮都被改写，把上游的 prompt cache 每轮打穿——那比这段文字本身贵得多。
+
+## 注入效果（`injectSection: true`）
 
 ```
-ENV-PROBE: 本机环境快照 (探测于 2026-11-13T20:11:34.319Z, 6 分钟前)
+ENV-PROBE: 本机环境快照 (探测于 2026-11-13T21:43:45.862Z)
 这份快照只描述探测时刻的状态。探测之后安装、升级、删除或改动 PATH 的运行时与工具都不会反映在这里，所以它可能已经过时。
 清单里的路径或版本与机器实际情况不符时，以真实命令的输出为准，并调用 `env_refresh` 工具重新探测。
 标记为未探测到的项，只表示探测时 PATH 上找不到它。
@@ -22,17 +31,17 @@ ENV-PROBE: 本机环境快照 (探测于 2026-11-13T20:11:34.319Z, 6 分钟前)
 ……
 ```
 
-标题带探测时间和相对年龄（`6 分钟前`），"可能过时"一眼可见。**没有**"缓存已过期"之类的标记：缓存超过 TTL 只会静默地在后台重探，标题里的时间永远是真相。
+也没有"缓存已过期"标记：过期只会静默后台重探，时间戳本身就说明了新旧。
 
-## 三个入口
+## 三个入口（两种模式都有）
 
 | 入口 | 面向谁 | 行为 |
 |---|---|---|
 | `/env-refresh` | 人（斜杠命令，需要命令适配器） | 立即重探、重写缓存，**只回差异**；已有探测在跑时**阻塞等待** |
 | `env_refresh` 工具 | 模型 | 同上，返回结构化 `{ ok, probedAt, summary, added[], removed[], changed[] }` |
-| `env_probe` 工具 | 模型 / PTC | **不触发探测**，直接把当前快照以结构化数据返回（`entries[].path` 等）；若后台正在探测则等待其完成 |
+| `env_probe` 工具 | 模型 / PTC | 快照的结构化版本（`entries[].path` 等）：缓存在 `cacheTtlHours` 内直接返回，过期或缺失才探测一次；已有探测在跑则等它而不是抢跑 |
 
-后两个都是结构化输出，方便 PTC（`run_code`）里直接读路径调工具：
+两个工具都是结构化输出，PTC（`run_code`）里可直接读路径调工具：
 
 ```js
 const env = await tools.env_probe({});
@@ -51,7 +60,7 @@ const python = env.entries.find((e) => e.name === 'python' && e.available);
   "shell": { "current": "C:\\WINDOWS\\system32\\cmd.exe", "available": ["pwsh", "powershell", "cmd"] },
   "entries": [
     { "name": "git", "kind": "runtime", "available": true, "path": "C:\\Program Files\\Git\\cmd\\git.exe", "version": "git version 2.51.0.windows.1" },
-    { "name": "7z",  "kind": "tool",    "available": true, "path": "C:\\Users\\...\\.local\\bin\\7z.cmd", "version": "7-Zip 25.01 ..." }
+    { "name": "7z",  "kind": "tool",    "available": true, "path": "C:\\Program Files\\7-Zip\\7z.exe", "version": "7-Zip 25.01 ..." }
   ],
   "disks": ["C: 22.5/466 GB free"],
   "proxy": []
@@ -67,13 +76,14 @@ const python = env.entries.find((e) => e.name === 'python' && e.available);
 - wget
 ```
 
-结构化部分是 `added: [{name, kind, available, path, version}]`、`removed: [name]`、`changed: [{name, kind: 'version'|'path', from, to}]`。无变化时 `summary` 只有一行 `较上次探测无变化`，三个数组为空；探测失败返回 `ok: false` + `error`。
+结构化部分是 `added: [{name, kind, available, path, version}]`、`removed: [name]`、`changed: [{name, kind: 'version'|'path', from, to}]`。无变化时 `summary` 只有一行"较上次探测无变化"，三个数组为空；探测失败返回 `ok: false` + `error`。
 
 ## 配置项
 
 | 键 | 默认值 | 含义 |
 |---|---|---|
-| `cacheTtlHours` | `1` | 缓存有效期（小时），过期后下次组装时静默后台重探 |
+| `cacheTtlHours` | `24` | 缓存有效期（小时），过期后静默后台重探 |
+| `injectSection` | `true` | 是否注册系统提示词段；`false` = 纯工具模式，零提示词开销 |
 | `order` | `30` | 系统提示词段顺序 |
 | `language` | `'en'` | 注入文本语言：`'en'` / `'zh'` |
 | `cacheDir` | `'~/.dsh-env-probe'` | 缓存目录（`env-profile.json` + `env-profile.md`） |
@@ -106,7 +116,8 @@ execAliases  = {
   name: dsh-env-probe
   config:
     language: zh
-    cacheTtlHours: 1
+    cacheTtlHours: 24
+    injectSection: true        # false = 只留工具，不注入提示词
     runtimes: [git, node, npm, pnpm, uv, dotnet, python, pip, java, go, rustc, docker]
     tools: [7z, just, sqlite3, curl, wget, ffmpeg, tar, unzip, make, gcc, pwsh]
     versionArgs:
@@ -118,15 +129,16 @@ execAliases  = {
 
 1. **修复 `/env-refresh` 注册失败**：`dsh 0.2.2-rc.1` 的 `dsh-commands` 要求 `input.hint` 非空，旧版传 `''` 导致每次加载都抛 `TypeError: ... input hint must not be empty`。
 2. **删除 `/env-suggest`**：它会强制 `agent.steer()` 提交消息并消耗模型 token，行为对用户不透明。
-3. **`/env-refresh` 只返回差异**，不再复述全量档案；后台已有探测时**阻塞等待**，不再拿旧缓存当新结果（旧实现探测失败时还会把上一次的报告当成功返回）。
-4. **`env_refresh` 工具**：同样的阻塞刷新、同样的差异返回，并重写注入用的缓存；输出是结构化的，PTC 可直接读。
-5. **`env_probe` 工具**：直接返回缓存快照的结构化版本（`entries[].path/version/available`），**不触发探测**，用于"我要一个可执行文件路径"这种高频需求。
+3. **`/env-refresh` 只返回差异**，后台已有探测时**阻塞等待**，不再拿旧缓存当新结果（旧实现探测失败时还会把上一次的报告当成功返回）。
+4. **`env_refresh` 工具**：阻塞刷新、只回差异、结构化输出、重写缓存。
+5. **`env_probe` 工具**：快照的结构化版本（`entries[].path/version/available`），按 TTL 兜底刷新，用于"要一个可执行文件路径"这种高频需求。
 6. **探测命令可配置**：`versionArgs` / `execAliases` / `shells`，不再写死在 JS 里。
 7. **标题与前言重写**：去掉"请信任它而不是猜测"，改为陈述"这是快照、可能已过时、与实况不符时以真实命令为准"，并指名 `env_refresh`。
 8. **修复 Windows 无扩展名垫片**：`where pnpm` 先命中 npm 写的 POSIX 启动器（无扩展名），`execFile` 无法执行，版本号采集不到；现在优先选同目录的 `.exe/.cmd/.bat`。
 9. **差异区分变化类型**：版本变化 `~ 名字: 旧 -> 新`，可执行文件换位置 `~ 名字 (path): 旧 -> 新`。
-10. **TTL 默认 1 小时**，并**删掉"缓存已过期"提示**：过期就静默后台重探，标题里的时间戳 + 相对年龄已足够说明新旧。
+10. **TTL 默认 24 小时**，删掉"缓存已过期"提示，并新增 `injectSection` 可整体关闭注入。
+11. **注入标题不再带相对年龄**：只写绝对探测时间，因此快照不重写时系统提示词逐字节不变（对 prompt cache 友好）。
 
 ## 插件契约
 
-遵循 dsh 官方插件标准（`docs/user/develop/basic`）：ESM 导出 `apply(ctx, config)`；`inject: ['systemPrompt']`；`commands` 与 `tools` 通过 `ctx.inject` 按需获取（缺失时注入部分照常工作）；`Config["~standard"].validate` 零依赖实现标准 Schema 接口；通过 `ctx.systemPrompt.section()` 注册有序段，`text` 为每次组装时求值的 provider。工具用普通 registry-ready 对象注册（`ctx.tools.register` 自行校验 `output.render` / `output.schema`），因此仍无任何依赖。
+遵循 dsh 官方插件标准（`docs/user/develop/basic`）：ESM 导出 `apply(ctx, config)`；不再声明硬性 `inject`，提示词段、命令、工具各自通过 `ctx.inject` 挂载，缺哪个服务都只少那一块；`Config["~standard"].validate` 零依赖实现标准 Schema 接口；通过 `ctx.systemPrompt.section()` 注册有序段，`text` 为每次组装时求值的 provider。工具用普通 registry-ready 对象注册（`ctx.tools.register` 自行校验 `output.render` / `output.schema`），因此仍无任何依赖。

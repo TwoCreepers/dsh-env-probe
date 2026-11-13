@@ -1,7 +1,7 @@
 {
   "name": "dsh-env-probe",
-  "version": "1.2.0",
-  "description": "Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environment (OS / shells / runtimes / tools / disks / proxy) once, caches the report, and injects it into every session's system prompt. v1.1.0: diff-only refresh command plus an env_refresh tool for the model, configurable version-probe commands, no /env-suggest.",
+  "version": "1.3.0",
+  "description": "Zero-dependency DeepSeek Harness (dsh) plugin: probes the local machine environment (OS / shells / runtimes / tools / disks / proxy) once, caches the report, and injects it into every session's system prompt. v1.3.0: diff-only refresh command plus an env_refresh tool for the model, configurable version-probe commands, no /env-suggest, optional injection, 24h TTL.",
   "license": "MIT",
   "type": "module",
   "main": "index.js",
